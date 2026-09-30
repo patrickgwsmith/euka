@@ -45,7 +45,7 @@ Euka supports these agent names:
 
 | Name | Agent |
 | --- | --- |
-| `claude`, `opus`, `sonnet` | Claude Code |
+| `claude`, `fable`, `opus`, `sonnet`, `haiku` | Claude Code |
 | `codex`, `sol`, `luna`, `terra` | Codex |
 | `pi` | Pi |
 | `fm` | Apple Foundation Models (macOS only) |
@@ -182,7 +182,9 @@ Put `+` before `bash?`, `zsh?`, `HEAD`, or `FEED` to watch a command or URL:
 
 Enter `+` alone to run each watch again and show only added lines. Enter `+-` to show both added and removed lines. Unchanged lines are omitted. Each check compares with the previous `+` or `+-` check, or with the first result if you have not checked yet.
 
-Numbered HTTP results, such as `[head #2]`, can be referenced in an agent request with `#2`. HTTP requests and agent requests share one number sequence.
+Every watch, HTTP request, and agent request uses the same number sequence. A watch's first successful result is revision 1; Euka adds another revision whenever its output changes. For example, `#3` shows watch #3's latest successful result, and `#3.2` shows its second revision. Agents can use the same references: `opus? What changed between #3.1 and #3.2?` A request for a watch still loading waits for its first result. Repeating the same `+` command keeps the existing watch number; enter `+` to refresh it. Watch revisions last until `reset` or exit.
+
+Numbered HTTP results, such as `[head #2]`, can also be referenced in an agent request with `#2`.
 
 ### Notes, todos, and URLs
 

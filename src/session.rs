@@ -58,6 +58,7 @@ pub struct LiveCommand {
     pub error: Option<String>,
     pub last_run: Option<String>,
     pub last_refresh: Instant,
+    pub revisions: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -150,6 +151,10 @@ pub enum Input<'a> {
     AgentNumberReference {
         id: usize,
     },
+    WatchRevisionReference {
+        id: usize,
+        revision: usize,
+    },
     Agent {
         task: &'a str,
         access: AgentAccess,
@@ -235,6 +240,8 @@ pub fn classify(line: &str) -> Input<'_> {
         Input::EnterFm
     } else if let Some((model, id)) = agent_reference(line.trim_end()) {
         Input::AgentReference { model, id }
+    } else if let Some((id, revision)) = watch_revision_reference(line.trim_end()) {
+        Input::WatchRevisionReference { id, revision }
     } else if let Some(id) = agent_number_reference(line.trim_end()) {
         Input::AgentNumberReference { id }
     } else if let Some((models, task)) = multi_agent_request(line) {
@@ -318,7 +325,16 @@ fn multi_agent_request(line: &str) -> Option<(Vec<&str>, &str)> {
 pub fn is_agent_model(model: &str) -> bool {
     matches!(
         model,
-        "fm" | "claude" | "opus" | "sonnet" | "codex" | "sol" | "luna" | "terra" | "pi"
+        "fm" | "claude"
+            | "fable"
+            | "opus"
+            | "sonnet"
+            | "haiku"
+            | "codex"
+            | "sol"
+            | "luna"
+            | "terra"
+            | "pi"
     )
 }
 
@@ -332,6 +348,11 @@ pub fn agent_reference(token: &str) -> Option<(&str, usize)> {
 
 pub fn agent_number_reference(token: &str) -> Option<usize> {
     parse_agent_id(token.strip_prefix('#')?)
+}
+
+pub fn watch_revision_reference(token: &str) -> Option<(usize, usize)> {
+    let (id, revision) = token.strip_prefix('#')?.split_once('.')?;
+    Some((parse_agent_id(id)?, parse_agent_id(revision)?))
 }
 
 fn parse_agent_id(number: &str) -> Option<usize> {
@@ -378,7 +399,10 @@ fn shell_target<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_number_reference, agent_reference, classify, AgentAccess, DiffMode, Input};
+    use super::{
+        agent_number_reference, agent_reference, classify, watch_revision_reference, AgentAccess,
+        DiffMode, Input,
+    };
 
     #[test]
     fn agent_reply_reference_is_explicit_syntax() {
@@ -400,6 +424,12 @@ mod tests {
         assert_eq!(agent_number_reference("#12"), Some(12));
         assert_eq!(agent_number_reference("#0"), None);
         assert_eq!(agent_number_reference("#3x"), None);
+        assert_eq!(watch_revision_reference("#3.2"), Some((3, 2)));
+        assert_eq!(watch_revision_reference("#3.0"), None);
+        assert!(matches!(
+            classify("#3.2"),
+            Input::WatchRevisionReference { id: 3, revision: 2 }
+        ));
         assert!(matches!(classify("# note"), Input::Comment("note")));
     }
 
@@ -479,7 +509,7 @@ mod tests {
 
     #[test]
     fn claude_model_aliases_are_agent_requests() {
-        for name in ["opus", "sonnet"] {
+        for name in ["fable", "opus", "sonnet", "haiku"] {
             let line = format!("{name}? inspect this");
             assert!(matches!(
                 classify(&line),
@@ -625,6 +655,7 @@ mod tests {
             error: None,
             last_run: None,
             last_refresh: std::time::Instant::now(),
+            revisions: Vec::new(),
         };
         assert_eq!(live.label(), "+ HEAD https://example.com/");
     }

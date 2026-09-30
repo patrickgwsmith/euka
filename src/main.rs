@@ -22,10 +22,8 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 use terminal::ReadResult;
 
 struct AgentUpdate {
@@ -75,7 +73,7 @@ fn render_agent(model: &str, id: usize, display: AgentDisplay<'_>) -> String {
             } else {
                 label
             };
-            if matches!(model, "claude" | "opus" | "sonnet") {
+            if matches!(model, "claude" | "fable" | "opus" | "sonnet" | "haiku") {
                 let budget = terminal::columns().saturating_sub(prefix.chars().count() + 1);
                 format!("{prefix} {}", one_line(text, budget))
             } else {
@@ -190,9 +188,8 @@ struct Workers {
     interactive: bool,
     next_http_id: usize,
     active_http: usize,
+    active_live: usize,
     hosts: HashMap<String, Sender<HttpRequest>>,
-    next_live_id: usize,
-    live_stop: HashMap<usize, Arc<AtomicBool>>,
 }
 
 impl Workers {
@@ -211,9 +208,8 @@ impl Workers {
             interactive,
             next_http_id: 1,
             active_http: 0,
+            active_live: 0,
             hosts: HashMap::new(),
-            next_live_id: 1,
-            live_stop: HashMap::new(),
         }
     }
 
@@ -280,6 +276,9 @@ fn main() {
         for line in io::stdin().lock().lines() {
             match line {
                 Ok(line) => {
+                    for update in drain_updates(&mut workers, &mut session) {
+                        println!("{update}");
+                    }
                     if let Some(status) = handle(&line, &mut session, &mut workers, &mut terminal) {
                         std::process::exit(status);
                     }
@@ -290,20 +289,21 @@ fn main() {
                 }
             }
         }
-        while workers.active_agents + workers.active_http > 0 {
-            match workers.worker_rx.recv() {
+        while workers.active_agents + workers.active_http + workers.active_live > 0 {
+            match workers.worker_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(update) => {
                     println!(
                         "{}",
                         format_worker_update(update, &mut session, &mut workers)
                     );
                 }
-                Err(_) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            for line in drain_updates(&mut workers, &mut session) {
+                println!("{line}");
             }
         }
-    }
-    for stop in workers.live_stop.values() {
-        stop.store(true, Ordering::Relaxed);
     }
     std::process::exit(session.last_status);
 }
@@ -388,9 +388,6 @@ fn reset_state(
     terminal: &mut terminal::Terminal,
 ) -> io::Result<()> {
     let fresh_session = Session::new()?;
-    for stop in workers.live_stop.values() {
-        stop.store(true, Ordering::Relaxed);
-    }
     let interactive = workers.interactive;
     *workers = Workers::new(interactive);
     *session = fresh_session;
@@ -511,13 +508,37 @@ fn handle(
             }
         },
         Input::AgentNumberReference { id } if agent_model_by_id(session, id).is_none() => {
-            match http_response_by_id(session, id) {
+            match watch_response_by_id(session, id, None)
+                .or_else(|| http_response_by_id(session, id))
+            {
                 Some(text) => {
                     println!("{text}");
                     session.last_status = 0;
                 }
                 None => {
-                    eprintln!("euka: no reply found for #{id}");
+                    if let Some(watch) = session.live_commands.iter().find(|watch| watch.id == id) {
+                        eprintln!("euka: {}", watch_reference_error(watch, None));
+                    } else {
+                        eprintln!("euka: no reply found for #{id}");
+                    }
+                    session.last_status = 1;
+                }
+            }
+        }
+        Input::WatchRevisionReference { id, revision } => {
+            match watch_response_by_id(session, id, Some(revision)) {
+                Some(text) => {
+                    println!("{text}");
+                    session.last_status = 0;
+                }
+                None => {
+                    let error = session
+                        .live_commands
+                        .iter()
+                        .find(|watch| watch.id == id)
+                        .map(|watch| watch_reference_error(watch, Some(revision)))
+                        .unwrap_or_else(|| format!("no watch found for #{id}"));
+                    eprintln!("euka: {error}");
                     session.last_status = 1;
                 }
             }
@@ -544,7 +565,7 @@ fn handle(
         }
         Input::LiveHead(url) => start_live_head(url, session, workers),
         Input::LiveFeed(url, selection) => start_live_feed(url, selection, session, workers),
-        Input::LiveDiff(mode) => show_live_diff(session, mode),
+        Input::LiveDiff(mode) => show_live_diff(session, workers, mode),
         Input::EnterFm => {
             session.mode = PromptMode::FmReadOnly;
             println!("[fm read-only mode; ., exit, or Ctrl-C returns to the shell]");
@@ -620,7 +641,7 @@ fn run_agent(
     match model {
         "fm" => fm::run(task, cwd, context, references, access),
         "claude" => claude::run(task, cwd, context, answer_chars, None, access, user),
-        "opus" | "sonnet" => {
+        "fable" | "opus" | "sonnet" | "haiku" => {
             claude::run(task, cwd, context, answer_chars, Some(model), access, user)
         }
         "codex" => codex::run(task, cwd, context, None, access, user),
@@ -888,18 +909,20 @@ fn start_live_feed(
 }
 
 fn start_live(target: LiveTarget, session: &mut Session, workers: &mut Workers) {
-    if let Some(index) = session
+    if let Some(existing) = session
         .live_commands
         .iter()
-        .position(|live| live.cwd == session.cwd && live.target == target)
+        .find(|live| live.cwd == session.cwd && live.target == target)
     {
-        let previous = session.live_commands.remove(index);
-        if let Some(stop) = workers.live_stop.remove(&previous.id) {
-            stop.store(true, Ordering::Relaxed);
-        }
+        println!(
+            "[watch #{}] already watching {}; enter + to refresh",
+            existing.id,
+            existing.label()
+        );
+        session.last_status = 0;
+        return;
     }
-    let id = workers.next_live_id;
-    workers.next_live_id += 1;
+    let id = workers.next_result_id();
     let cwd = session.cwd.clone();
     session.live_commands.push(LiveCommand {
         id,
@@ -909,8 +932,13 @@ fn start_live(target: LiveTarget, session: &mut Session, workers: &mut Workers) 
         error: None,
         last_run: None,
         last_refresh: Instant::now(),
+        revisions: Vec::new(),
     });
-    let stop = Arc::new(AtomicBool::new(false));
+    println!(
+        "[watch #{id} loading] {}",
+        session.live_commands.last().unwrap().label()
+    );
+    workers.active_live += 1;
     let tx = workers.live_tx.clone();
     std::thread::spawn(move || {
         let client = http::agent();
@@ -926,7 +954,6 @@ fn start_live(target: LiveTarget, session: &mut Session, workers: &mut Workers) 
             return;
         }
     });
-    workers.live_stop.insert(id, stop);
     session.last_status = 0;
 }
 
@@ -950,7 +977,7 @@ fn run_live_target(
     }
 }
 
-fn show_live_diff(session: &mut Session, mode: DiffMode) {
+fn show_live_diff(session: &mut Session, workers: &mut Workers, mode: DiffMode) {
     if session.live_commands.is_empty() {
         println!(
             "[+] no live values; register one with + bash? command, + HEAD URL, or + FEED URL"
@@ -974,7 +1001,12 @@ fn show_live_diff(session: &mut Session, mode: DiffMode) {
             };
             if !lines.is_empty() {
                 showed_lines = true;
-                println!("[{} in {}]\n{lines}", live.label(), live.cwd.display(),);
+                println!(
+                    "[watch {} {} in {}]\n{lines}",
+                    watch_revision_label(live),
+                    live.label(),
+                    live.cwd.display()
+                );
             }
         }
         live.last_run = Some(current);
@@ -985,6 +1017,7 @@ fn show_live_diff(session: &mut Session, mode: DiffMode) {
             DiffMode::AddedAndRemoved => println!("[+-] no changed lines"),
         }
     }
+    resume_queued_agents(session, workers);
     session.last_status = if failed { 1 } else { 0 };
 }
 
@@ -1101,6 +1134,7 @@ fn print_help() {
     println!("  + https://...       Watch an Atom URL if its Content-Type identifies a feed");
     println!("  +                   Show added lines from all live values");
     println!("  +-                  Show added and removed lines from all live values");
+    println!("  #3, #3.2            Show the latest watch result or revision 2 of watch #3");
     println!("Shared context:");
     println!("  https://...          Load a text resource into session context (background)");
     println!("  HEAD https://...     Show response headers and time to receive them");
@@ -1108,8 +1142,10 @@ fn print_help() {
     println!("  - [ ] todo          Add a session todo");
     println!("Agent:");
     println!("  claude? task        Ask Claude Code to inspect the project (background)");
+    println!("  fable? task         Ask Claude Code with Fable (background)");
     println!("  opus? task          Ask Claude Code with Opus (background)");
     println!("  sonnet? task        Ask Claude Code with Sonnet (background)");
+    println!("  haiku? task         Ask Claude Code with Haiku (background)");
     println!("  codex? task         Ask Codex to inspect the project (background)");
     println!("  sol? task           Ask GPT-6 Sol through Codex (background)");
     println!("  luna? task          Ask GPT-6 Luna through Codex (background)");
@@ -1123,7 +1159,7 @@ fn print_help() {
     println!("  fm?                 Enter fm read-only mode; ., exit, or Ctrl-C returns");
     println!("  git commit -m luna?(Suggest a message)  Use one agent reply as an argument");
     println!("  echo $(date)        Run shell command substitution via Bash or Zsh");
-    println!("  #3, codex#3         Show a numbered HTTP result or full agent reply");
+    println!("  #3, codex#3         Show a numbered result or full agent reply");
     println!("  claude? agree? #3   Include a numbered result; queue if an agent is still working");
     println!("  ? task, ! task, and other + forms are not available yet");
     println!("  Unknown name? or name! targets report an Euka error");
@@ -1179,8 +1215,12 @@ fn session_context_filtered(
 ) -> String {
     let mut context = format!("cwd: {}\n", cwd.display());
     for live in &session.live_commands {
+        if referenced_ids.contains(&live.id) {
+            continue;
+        }
         context.push_str(&format!(
-            "live {} in {}:\n{}\n",
+            "watch {} {} in {}:\n{}\n",
+            watch_revision_label(live),
             live.label(),
             live.cwd.display(),
             live_current_text(live)
@@ -1311,6 +1351,34 @@ fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
     })
 }
 
+fn watch_response_by_id(session: &Session, id: usize, revision: Option<usize>) -> Option<String> {
+    let watch = session.live_commands.iter().find(|watch| watch.id == id)?;
+    let revision = revision.unwrap_or(watch.revisions.len());
+    let output = watch.revisions.get(revision.checked_sub(1)?)?;
+    Some(format!(
+        "watch #{id}.{revision} {} in {}:\n{output}",
+        watch.label(),
+        watch.cwd.display()
+    ))
+}
+
+fn watch_revision_label(watch: &LiveCommand) -> String {
+    if watch.revisions.is_empty() {
+        format!("#{}", watch.id)
+    } else {
+        format!("#{}.{}", watch.id, watch.revisions.len())
+    }
+}
+
+fn watch_reference_error(watch: &LiveCommand, revision: Option<usize>) -> String {
+    match (revision, watch.revisions.len(), &watch.error) {
+        (None | Some(1), 0, None) => format!("watch #{} is still loading", watch.id),
+        (_, 0, Some(error)) => format!("watch #{} has no result: {error}", watch.id),
+        (Some(revision), _, _) => format!("watch #{} has no revision {revision}", watch.id),
+        (None, _, _) => unreachable!(),
+    }
+}
+
 fn ready_references(
     task: &str,
     session: &Session,
@@ -1320,8 +1388,11 @@ fn ready_references(
         ReferenceResolution::Ready(references) => Ok(references),
         ReferenceResolution::Pending(ids) => {
             let id = ids[0];
-            let model = agent_model_by_id(session, id).expect("pending agent has a request");
-            Err(format!("{model}#{id} is still working"))
+            if let Some(model) = agent_model_by_id(session, id) {
+                Err(format!("{model}#{id} is still working"))
+            } else {
+                Err(format!("watch #{id} is still loading"))
+            }
         }
     }
 }
@@ -1333,14 +1404,34 @@ fn resolve_references(
 ) -> Result<ReferenceResolution, String> {
     let mut context = String::new();
     let mut seen = BTreeSet::new();
+    let mut seen_watch_revisions = BTreeSet::new();
     let mut pending = BTreeSet::new();
-    for token in task.split(|character: char| {
+    for raw_token in task.split(|character: char| {
         !(character.is_ascii_alphanumeric()
             || character == '#'
+            || character == '.'
             || character == '_'
             || character == '-')
     }) {
-        let reference = if let Some((model, id)) = session::agent_reference(token) {
+        let token = raw_token.trim_end_matches('.');
+        let reference = if let Some((id, revision)) = session::watch_revision_reference(token) {
+            let watch = session
+                .live_commands
+                .iter()
+                .find(|watch| watch.id == id)
+                .ok_or_else(|| format!("no watch found for #{id}"))?;
+            if let Some(text) = watch_response_by_id(session, id, Some(revision)) {
+                if seen_watch_revisions.insert((id, revision)) {
+                    seen.insert(id);
+                    context.push_str(&format!("\nReferenced {text}\n"));
+                }
+            } else if watch.revisions.is_empty() && watch.error.is_none() && revision == 1 {
+                pending.insert(id);
+            } else {
+                return Err(watch_reference_error(watch, Some(revision)));
+            }
+            None
+        } else if let Some((model, id)) = session::agent_reference(token) {
             if agent_model_by_id(session, id) != Some(model) {
                 return Err(format!("no reply found for {model}#{id}"));
             }
@@ -1348,6 +1439,19 @@ fn resolve_references(
         } else if let Some(id) = session::agent_number_reference(token) {
             if let Some(model) = agent_model_by_id(session, id) {
                 Some((model, id))
+            } else if let Some(watch) = session.live_commands.iter().find(|watch| watch.id == id) {
+                if let Some(text) = watch_response_by_id(session, id, None) {
+                    let revision = watch.revisions.len();
+                    if seen_watch_revisions.insert((id, revision)) {
+                        seen.insert(id);
+                        context.push_str(&format!("\nReferenced {text}\n"));
+                    }
+                } else if watch.error.is_none() {
+                    pending.insert(id);
+                } else {
+                    return Err(watch_reference_error(watch, None));
+                }
+                None
             } else if let Some(text) = http_response_by_id(session, id) {
                 if seen.insert(id) {
                     context.push_str(&format!("\nReferenced HTTP result #{id}:\n{text}\n"));
@@ -1388,18 +1492,24 @@ fn drain_updates(workers: &mut Workers, session: &mut Session) -> Vec<String> {
     while let Ok(update) = workers.worker_rx.try_recv() {
         lines.push(format_worker_update(update, session, workers));
     }
+    let mut watch_updated = false;
     while let Ok(update) = workers.live_rx.try_recv() {
+        workers.active_live = workers.active_live.saturating_sub(1);
         if let Some(live) = session
             .live_commands
             .iter_mut()
             .find(|live| live.id == update.id)
         {
             if update.started_at >= live.last_refresh {
+                watch_updated = true;
                 if let Some(line) = update_live_command(live, update.result, Instant::now()) {
                     lines.push(line);
                 }
             }
         }
+    }
+    if watch_updated {
+        resume_queued_agents(session, workers);
     }
     lines
 }
@@ -1412,19 +1522,34 @@ fn update_live_command(
     live.last_refresh = checked_at;
     match result {
         Ok(output) => {
-            let changed = output != live.output || live.error.take().is_some();
+            let first_result = live.revisions.is_empty();
+            let changed = first_result || output != live.output || live.error.take().is_some();
+            if live.revisions.last() != Some(&output) {
+                live.revisions.push(output.clone());
+            }
             live.output = output.clone();
             if live.last_run.is_none() {
                 live.last_run = Some(output.clone());
             }
-            changed.then(|| format!("[{}] {output}", live.label()))
+            changed.then(|| {
+                format!(
+                    "[watch #{}.{} {}] {output}",
+                    live.id,
+                    live.revisions.len(),
+                    live.label()
+                )
+            })
         }
         Err(error) if live.error.as_deref() != Some(&error) => {
             live.error = Some(error.clone());
             if live.last_run.is_none() {
                 live.last_run = Some(format!("error: {error}"));
             }
-            Some(format!("[{} error] {error}", live.label()))
+            Some(format!(
+                "[watch #{} {} error] {error}",
+                live.id,
+                live.label()
+            ))
         }
         Err(_) => None,
     }
@@ -1561,8 +1686,6 @@ mod tests {
     use crate::session::{AgentAccess, DiffMode, Event, PromptMode, Session};
     use crate::terminal::Terminal;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
 
     #[test]
     fn reset_restarts_counters_and_discards_old_worker_updates() {
@@ -1575,8 +1698,6 @@ mod tests {
         workers.next_agent_id = 4;
         workers.next_http_id = 3;
         let old_sender = workers.worker_tx.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        workers.live_stop.insert(1, stop.clone());
         let mut terminal = Terminal::new();
 
         reset_state(&mut session, &mut workers, &mut terminal).unwrap();
@@ -1588,7 +1709,6 @@ mod tests {
         assert!(session.live_commands.is_empty());
         assert!(session.mode == PromptMode::Shell);
         assert_eq!(session.last_status, 0);
-        assert!(stop.load(Ordering::Relaxed));
         assert!(old_sender
             .send(super::WorkerUpdate::Agent(super::AgentUpdate {
                 id: 1,
@@ -1927,5 +2047,67 @@ mod tests {
         assert_eq!(workers.next_result_id(), 2);
         assert_eq!(workers.next_agent_id, 3);
         assert_eq!(workers.next_http_id, 3);
+    }
+
+    #[test]
+    fn watch_results_keep_numbered_revisions_and_support_references() {
+        let mut session = Session::new().unwrap();
+        session.live_commands.push(crate::session::LiveCommand {
+            id: 1,
+            cwd: session.cwd.clone(),
+            target: crate::session::LiveTarget::Shell {
+                program: "bash",
+                command: "printf result".into(),
+            },
+            output: String::new(),
+            error: None,
+            last_run: None,
+            last_refresh: std::time::Instant::now(),
+            revisions: Vec::new(),
+        });
+        let workers = Workers::new(false);
+        assert!(matches!(
+            resolve_references("summarize #1", &session, &workers).unwrap(),
+            ReferenceResolution::Pending(ids) if ids == [1]
+        ));
+
+        let watch = &mut session.live_commands[0];
+        assert!(
+            super::update_live_command(watch, Ok("first".into()), std::time::Instant::now())
+                .unwrap()
+                .contains("#1.1")
+        );
+        assert!(
+            super::update_live_command(watch, Ok("first".into()), std::time::Instant::now())
+                .is_none()
+        );
+        assert_eq!(watch.revisions.len(), 1);
+        assert!(
+            super::update_live_command(watch, Ok("second".into()), std::time::Instant::now())
+                .unwrap()
+                .contains("#1.2")
+        );
+        assert_eq!(watch.revisions.len(), 2);
+        super::update_live_command(
+            watch,
+            Err("temporary failure".into()),
+            std::time::Instant::now(),
+        );
+        assert_eq!(watch.revisions.len(), 2);
+
+        assert!(super::watch_response_by_id(&session, 1, None)
+            .unwrap()
+            .contains("second"));
+        assert!(super::watch_response_by_id(&session, 1, Some(1))
+            .unwrap()
+            .contains("first"));
+        let ReferenceResolution::Ready(references) =
+            resolve_references("compare #1.1 and #1.2 with #1.", &session, &workers).unwrap()
+        else {
+            panic!("watch results should be ready")
+        };
+        assert_eq!(references.text.matches("Referenced watch #1.1").count(), 1);
+        assert_eq!(references.text.matches("Referenced watch #1.2").count(), 1);
+        assert_eq!(references.ids.into_iter().collect::<Vec<_>>(), vec![1]);
     }
 }
