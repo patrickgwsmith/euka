@@ -1383,8 +1383,9 @@ fn one_line(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         agent_response, agent_response_by_id, diff_lines, format_update, highlight_answer,
-        one_line, prompt, referenced_context, render_agent, reset_state, session_context,
-        shortened_path, start_agents, AgentDisplay, AgentUpdate, Workers,
+        one_line, prompt, referenced_context, render_agent, reset_state, resolve_references,
+        session_context, shortened_path, start_agents, AgentDisplay, AgentUpdate,
+        ReferenceResolution, Workers,
     };
     use crate::agent_cli::AgentUser;
     use crate::session::{AgentAccess, Event, PromptMode, Session};
@@ -1602,6 +1603,48 @@ mod tests {
         assert!(line.contains("referenced reply unavailable: sol#2 has no reply"));
         assert!(workers.pending_agents.is_empty());
         assert_eq!(workers.active_agents, 0);
+    }
+
+    #[test]
+    fn queued_request_waits_for_every_referenced_reply() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        for id in [1, 2] {
+            session.events.push(Event::AgentRequest {
+                id,
+                input: "inspect".into(),
+                access: AgentAccess::ReadOnly,
+                model: Some("sol".into()),
+            });
+            workers.pending_agents.insert(id, format!("sol#{id}: …"));
+        }
+        let task = "compare #1 and #2";
+        assert!(matches!(
+            resolve_references(task, &session, &workers).unwrap(),
+            ReferenceResolution::Pending(ids) if ids == [1, 2]
+        ));
+        workers.pending_agents.remove(&1);
+        session.events.push(Event::AgentResponse {
+            id: 1,
+            model: "sol".into(),
+            text: "first".into(),
+        });
+        assert!(matches!(
+            resolve_references(task, &session, &workers).unwrap(),
+            ReferenceResolution::Pending(ids) if ids == [2]
+        ));
+        workers.pending_agents.remove(&2);
+        session.events.push(Event::AgentResponse {
+            id: 2,
+            model: "sol".into(),
+            text: "second".into(),
+        });
+        assert!(matches!(
+            resolve_references(task, &session, &workers).unwrap(),
+            ReferenceResolution::Ready(context)
+                if context.contains("Referenced reply sol#1:\nfirst")
+                    && context.contains("Referenced reply sol#2:\nsecond")
+        ));
     }
 
     #[test]
