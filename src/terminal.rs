@@ -678,7 +678,7 @@ fn selector_highlight(line: &str) -> Option<(usize, usize, SelectorKind)> {
     let rest = &line[start..];
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let selector = &rest[..end];
-    let kind = if matches!(selector, "bash?" | "zsh?" | "@staffer") {
+    let kind = if matches!(selector, "bash?" | "zsh?" | "@staffer" | "HEAD" | "FEED") {
         SelectorKind::ReaderShell
     } else if !live && matches!(selector, "bash!" | "zsh!") {
         SelectorKind::HostShell
@@ -970,6 +970,9 @@ mod tests {
         colored.clear();
         write_input(&mut colored, "+ bash? git status", true).unwrap();
         assert_eq!(colored, b"+ \x1b[1;34mbash?\x1b[0m git status");
+        colored.clear();
+        write_input(&mut colored, "+ HEAD https://example.com", true).unwrap();
+        assert_eq!(colored, b"+ \x1b[1;34mHEAD\x1b[0m https://example.com");
         colored.clear();
         write_input(&mut colored, "bash! rm file", true).unwrap();
         assert_eq!(colored, b"\x1b[1;31mbash!\x1b[0m rm file");

@@ -69,7 +69,7 @@ For a `!` request, Codex uses its `workspace-write` sandbox. Other agents can wr
 Put `@staffer` before a request to run the agent as the `staffer` Unix user:
 
 ```text
-@staffer opus? Is there a LICENSE?
+@staffer opus? Is there a README.md yet?
 ```
 
 Before you use `@staffer`, do these steps:
@@ -100,7 +100,7 @@ Each request gets a label, for example `codex#3`. Numbers are unique across all 
 - When the answer is ready, Euka shows `codex#3: answer`.
 - To show the full answer, enter `#3` or `codex#3`.
 - To give an answer to a different agent, refer to it in the request. For example: `claude? do you agree with #3?`
-- If a request refers to an unfinished answer, Euka queues it in the background, shows `waiting for #3`, and starts it when the answer arrives. A request with several references waits for all of them. If a referenced request fails, the queued request reports the failure.
+- If a request refers to an unfinished answer, Euka queues it in the background, shows `waiting for #3`, and starts it when the answer arrives. A request with several references waits for all of them. Euka builds the queued request's context after those answers enter the session log and includes each referenced answer once. If a referenced request fails, the queued request reports the failure.
 - Entering `#3` by itself while it is still running reports that it is still in progress.
 
 Labels stay available until you exit Euka or enter `reset`.
@@ -163,20 +163,26 @@ Euka does not change the script and does not use an LLM. Changes to the director
 
 **Warning:** `staffer` can write to all paths that `staffer` has write access to, for example group-writable paths. `bash?` and `zsh?` are not a read-only sandbox.
 
-### Watch a command
+### Watch a command or URL
 
-Put `+` before `bash?` or `zsh?` to watch a command:
+Put `+` before `bash?`, `zsh?`, `HEAD`, or `FEED` to watch a command or URL:
 
 ```text
 + bash? git status
++ HEAD https://github.com/patrickgwsmith/euka
++ FEED https://github.com/patrickgwsmith/euka/commits/main.atom
++ https://github.com/patrickgwsmith/euka/commits/main.atom
 ```
 
-- Euka runs the command as `staffer` every two seconds.
+- Euka runs each watch once when registered and again only when you enter `+` or `+-`. Shell watches run as `staffer`; HEAD and feed watches use Euka's HTTP client.
+- `+ URL` accepts an Atom feed when its response has `Content-Type: application/atom+xml`. Use `+ FEED URL` to parse an Atom feed served with a generic XML content type. Feed entries show their title and link; `+` shows new entries and `+-` also shows entries that disappeared from the feed.
 - Agents can see the output in the shared session.
-- You must configure passwordless `sudo` for `staffer` first. Errors show at the prompt.
+- Shell watches need passwordless `sudo` for `staffer`. Errors show at the prompt.
 - You can watch more than one command or directory at the same time.
 
-Enter `+` alone to run each watched command again. Euka then shows the lines that changed since the last `+`, or since the first result.
+Enter `+` alone to run each watch again and show only added lines. Enter `+-` to show both added and removed lines. Unchanged lines are omitted. Each check compares with the previous `+` or `+-` check, or with the first result if you have not checked yet.
+
+Numbered HTTP results, such as `[head #2]`, can be referenced in an agent request with `#2`. HTTP requests and agent requests share one number sequence.
 
 ### Notes, todos, and URLs
 
@@ -188,7 +194,7 @@ Euka keeps these items in the session, and agents can see them:
 
 Euka does not follow redirects. It shows the new URL. To load that page, enter the new URL.
 
-Enter `HEAD https://...` to show the response headers and the time to receive them. Euka does not (yet) show separate DNS, TCP, and TLS times.
+Enter `HEAD https://...` to show the response headers and the time to receive them. Enter `+ HEAD https://...` to register a HEAD watch, then enter `+` when you want to refresh it and compare results. Euka does not (yet) show separate DNS, TCP, and TLS times.
 
 ### Reset the session
 

@@ -1,6 +1,7 @@
 mod agent_cli;
 mod claude;
 mod codex;
+mod feed;
 mod fm;
 mod http;
 mod inline;
@@ -11,7 +12,10 @@ mod shell;
 mod terminal;
 
 use agent_cli::AgentUser;
-use session::{AgentAccess, Event, Input, LiveCommand, PromptMode, Resource, Session};
+use session::{
+    AgentAccess, DiffMode, Event, FeedSelection, Input, LiveCommand, LiveTarget, PromptMode,
+    Resource, Session,
+};
 use shell::Outcome;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufRead, Write};
@@ -21,7 +25,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use terminal::ReadResult;
 
 struct AgentUpdate {
@@ -36,14 +40,19 @@ struct QueuedAgent {
     model: String,
     task: String,
     cwd: PathBuf,
-    base_context: String,
     answer_chars: usize,
     access: AgentAccess,
     user: AgentUser,
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedReferences {
+    text: String,
+    ids: BTreeSet<usize>,
+}
+
 enum ReferenceResolution {
-    Ready(String),
+    Ready(ResolvedReferences),
     Pending(Vec<usize>),
 }
 
@@ -206,6 +215,13 @@ impl Workers {
             next_live_id: 1,
             live_stop: HashMap::new(),
         }
+    }
+
+    fn next_result_id(&mut self) -> usize {
+        let id = self.next_agent_id.max(self.next_http_id);
+        self.next_agent_id = id + 1;
+        self.next_http_id = id + 1;
+        id
     }
 }
 
@@ -494,6 +510,18 @@ fn handle(
                 session.last_status = 1;
             }
         },
+        Input::AgentNumberReference { id } if agent_model_by_id(session, id).is_none() => {
+            match http_response_by_id(session, id) {
+                Some(text) => {
+                    println!("{text}");
+                    session.last_status = 0;
+                }
+                None => {
+                    eprintln!("euka: no reply found for #{id}");
+                    session.last_status = 1;
+                }
+            }
+        }
         Input::AgentNumberReference { id } => match agent_response_by_id(session, id, workers) {
             Ok((model, text)) => {
                 println!(
@@ -514,7 +542,9 @@ fn handle(
         Input::LiveHostShell { program, command } => {
             start_live_command(program, command, session, workers)
         }
-        Input::LiveDiff => show_live_diff(session),
+        Input::LiveHead(url) => start_live_head(url, session, workers),
+        Input::LiveFeed(url, selection) => start_live_feed(url, selection, session, workers),
+        Input::LiveDiff(mode) => show_live_diff(session, mode),
         Input::EnterFm => {
             session.mode = PromptMode::FmReadOnly;
             println!("[fm read-only mode; ., exit, or Ctrl-C returns to the shell]");
@@ -615,14 +645,14 @@ fn resolve_inline(
         match part {
             inline::Part::Literal(text) => resolved.push_str(text),
             inline::Part::Agent { model, task } => {
-                let references = referenced_context(task, session, workers)?;
-                let id = workers.next_agent_id;
-                workers.next_agent_id += 1;
-                let mut context = session_context(session);
+                let references = ready_references(task, session, workers)?;
+                let id = workers.next_result_id();
+                let mut context =
+                    session_context_filtered(session, &references.ids, None, &session.cwd);
                 context.push_str(&format!(
                     "request ({model}#{id}, read-only, current user): {task}\n"
                 ));
-                context.push_str(&references);
+                context.push_str(&references.text);
                 session.events.push(Event::AgentRequest {
                     id,
                     input: task.to_owned(),
@@ -639,7 +669,7 @@ fn resolve_inline(
                     task,
                     &session.cwd,
                     &context,
-                    &references,
+                    &references.text,
                     answer_chars,
                     AgentAccess::ReadOnly,
                     AgentUser::Current,
@@ -691,10 +721,8 @@ fn start_agents(
             return;
         }
     };
-    let base_context = session_context(session);
     for &model in models {
-        let id = workers.next_agent_id;
-        workers.next_agent_id += 1;
+        let id = workers.next_result_id();
         workers.active_agents += 1;
         session.events.push(Event::AgentRequest {
             id,
@@ -710,14 +738,13 @@ fn start_agents(
             model: model.to_owned(),
             task: task.to_owned(),
             cwd: session.cwd.clone(),
-            base_context: base_context.clone(),
             answer_chars,
             access,
             user,
         };
         let status = match &references {
-            ReferenceResolution::Ready(context) => {
-                launch_agent(request, context.clone(), workers);
+            ReferenceResolution::Ready(references) => {
+                launch_agent(request, references.clone(), session, workers);
                 render_agent(model, id, AgentDisplay::Working)
             }
             ReferenceResolution::Pending(ids) => {
@@ -739,26 +766,23 @@ fn start_agents(
     session.last_status = 0;
 }
 
-fn launch_agent(request: QueuedAgent, references: String, workers: &mut Workers) {
+fn launch_agent(
+    request: QueuedAgent,
+    references: ResolvedReferences,
+    session: &Session,
+    workers: &mut Workers,
+) {
+    let context = agent_context(session, &request, &references);
     let QueuedAgent {
         id,
         model,
         task,
         cwd,
-        mut base_context,
         answer_chars,
         access,
         user,
     } = request;
-    let username = match user {
-        AgentUser::Current => "current user",
-        AgentUser::Staffer => "staffer",
-    };
-    base_context.push_str(&format!(
-        "request ({model}#{id}, {}, {username}): {task}\n",
-        access.description()
-    ));
-    base_context.push_str(&references);
+    let references = references.text;
     workers
         .pending_agents
         .insert(id, render_agent(&model, id, AgentDisplay::Working));
@@ -768,7 +792,7 @@ fn launch_agent(request: QueuedAgent, references: String, workers: &mut Workers)
             &model,
             &task,
             &cwd,
-            &base_context,
+            &context,
             &references,
             answer_chars,
             access,
@@ -783,6 +807,28 @@ fn launch_agent(request: QueuedAgent, references: String, workers: &mut Workers)
     });
 }
 
+fn agent_context(
+    session: &Session,
+    request: &QueuedAgent,
+    references: &ResolvedReferences,
+) -> String {
+    let mut context =
+        session_context_filtered(session, &references.ids, Some(request.id), &request.cwd);
+    let username = match request.user {
+        AgentUser::Current => "current user",
+        AgentUser::Staffer => "staffer",
+    };
+    context.push_str(&format!(
+        "request ({}#{}, {}, {username}): {}\n",
+        request.model,
+        request.id,
+        request.access.description(),
+        request.task
+    ));
+    context.push_str(&references.text);
+    context
+}
+
 fn start_live_command(
     program: &'static str,
     command: &str,
@@ -795,9 +841,58 @@ fn start_live_command(
         session.last_status = 1;
         return;
     }
-    if let Some(index) = session.live_commands.iter().position(|live| {
-        live.cwd == session.cwd && live.program == program && live.command == command
-    }) {
+    start_live(
+        LiveTarget::Shell {
+            program,
+            command: command.to_owned(),
+        },
+        session,
+        workers,
+    );
+}
+
+fn start_live_head(url: &str, session: &mut Session, workers: &mut Workers) {
+    if let Err(error) = http::origin(url) {
+        eprintln!("euka: {error}");
+        session.last_status = 1;
+        return;
+    }
+    start_live(
+        LiveTarget::Head {
+            url: url.to_owned(),
+        },
+        session,
+        workers,
+    );
+}
+
+fn start_live_feed(
+    url: &str,
+    selection: FeedSelection,
+    session: &mut Session,
+    workers: &mut Workers,
+) {
+    if let Err(error) = http::origin(url) {
+        eprintln!("euka: {error}");
+        session.last_status = 1;
+        return;
+    }
+    start_live(
+        LiveTarget::Feed {
+            url: url.to_owned(),
+            selection,
+        },
+        session,
+        workers,
+    );
+}
+
+fn start_live(target: LiveTarget, session: &mut Session, workers: &mut Workers) {
+    if let Some(index) = session
+        .live_commands
+        .iter()
+        .position(|live| live.cwd == session.cwd && live.target == target)
+    {
         let previous = session.live_commands.remove(index);
         if let Some(stop) = workers.live_stop.remove(&previous.id) {
             stop.store(true, Ordering::Relaxed);
@@ -806,78 +901,89 @@ fn start_live_command(
     let id = workers.next_live_id;
     workers.next_live_id += 1;
     let cwd = session.cwd.clone();
-    let script = command.to_owned();
     session.live_commands.push(LiveCommand {
         id,
         cwd: cwd.clone(),
-        program,
-        command: script.clone(),
+        target: target.clone(),
         output: String::new(),
         error: None,
         last_run: None,
         last_refresh: Instant::now(),
     });
     let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = stop.clone();
     let tx = workers.live_tx.clone();
     std::thread::spawn(move || {
+        let client = http::agent();
         let started_at = Instant::now();
         if tx
             .send(LiveUpdate {
                 id,
                 started_at,
-                result: live::run(program, &script, &cwd),
+                result: run_live_target(&target, &cwd, &client),
             })
             .is_err()
         {
             return;
-        }
-        while !worker_stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(2));
-            if worker_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let started_at = Instant::now();
-            if tx
-                .send(LiveUpdate {
-                    id,
-                    started_at,
-                    result: live::run(program, &script, &cwd),
-                })
-                .is_err()
-            {
-                break;
-            }
         }
     });
     workers.live_stop.insert(id, stop);
     session.last_status = 0;
 }
 
-fn show_live_diff(session: &mut Session) {
+fn run_live_target(
+    target: &LiveTarget,
+    cwd: &Path,
+    client: &ureq::Agent,
+) -> Result<String, String> {
+    match target {
+        LiveTarget::Shell { program, command } => live::run(program, command, cwd),
+        LiveTarget::Head { url } => http::head(client, url),
+        LiveTarget::Feed { url, selection } => {
+            let resource = http::load(client, url)?;
+            if *selection == FeedSelection::ContentType
+                && !feed::is_atom_content_type(&resource.content_type)
+            {
+                return Err(format!("URL is not an Atom feed (Content-Type: {}); use + FEED URL to parse an XML feed explicitly", resource.content_type));
+            }
+            feed::render(&resource)
+        }
+    }
+}
+
+fn show_live_diff(session: &mut Session, mode: DiffMode) {
     if session.live_commands.is_empty() {
-        println!("[+] no live values; register one with + bash? command");
+        println!(
+            "[+] no live values; register one with + bash? command, + HEAD URL, or + FEED URL"
+        );
         return;
     }
     let mut failed = false;
+    let mut showed_lines = false;
+    let client = http::agent();
     for live in &mut session.live_commands {
-        let result = live::run(live.program, &live.command, &live.cwd);
+        let previous = live.last_run.clone();
+        let result = run_live_target(&live.target, &live.cwd, &client);
         failed |= result.is_err();
         let _ = update_live_command(live, result, Instant::now());
         let current = live_current_text(live);
-        let label = live.label();
-        match live.last_run.as_deref() {
-            Some(previous) if previous != current => {
-                println!(
-                    "[{label} in {}]\n{}",
-                    live.cwd.display(),
-                    diff_lines(previous, &current)
-                );
+        if let Some(previous) = previous {
+            let lines = if matches!(live.target, LiveTarget::Feed { .. }) {
+                feed::diff(&previous, &current, mode)
+            } else {
+                diff_lines(&previous, &current, mode)
+            };
+            if !lines.is_empty() {
+                showed_lines = true;
+                println!("[{} in {}]\n{lines}", live.label(), live.cwd.display(),);
             }
-            Some(_) => println!("[{label} in {}] unchanged", live.cwd.display()),
-            None => println!("[{label} in {}] baseline set", live.cwd.display()),
         }
         live.last_run = Some(current);
+    }
+    if !showed_lines {
+        match mode {
+            DiffMode::Added => println!("[+] no added lines"),
+            DiffMode::AddedAndRemoved => println!("[+-] no changed lines"),
+        }
     }
     session.last_status = if failed { 1 } else { 0 };
 }
@@ -889,7 +995,7 @@ fn live_current_text(live: &LiveCommand) -> String {
     }
 }
 
-fn diff_lines(previous: &str, current: &str) -> String {
+fn diff_lines(previous: &str, current: &str, mode: DiffMode) -> String {
     let old: Vec<_> = previous.lines().collect();
     let new: Vec<_> = current.lines().collect();
     let mut common = vec![vec![0; new.len() + 1]; old.len() + 1];
@@ -902,23 +1008,23 @@ fn diff_lines(previous: &str, current: &str) -> String {
             };
         }
     }
-    let mut output = String::from("--- last +\n+++ now\n");
+    let mut lines = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < old.len() || j < new.len() {
         if i < old.len() && j < new.len() && old[i] == new[j] {
-            output.push_str(&format!(" {}\n", old[i]));
             i += 1;
             j += 1;
         } else if i < old.len() && (j == new.len() || common[i + 1][j] >= common[i][j + 1]) {
-            output.push_str(&format!("-{}\n", old[i]));
+            if mode == DiffMode::AddedAndRemoved {
+                lines.push(format!("-{}", old[i]));
+            }
             i += 1;
         } else {
-            output.push_str(&format!("+{}\n", new[j]));
+            lines.push(format!("+{}", new[j]));
             j += 1;
         }
     }
-    output.pop(); // Remove only the final newline, preserving whitespace in status lines.
-    output
+    lines.join("\n")
 }
 
 fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Workers) {
@@ -930,6 +1036,7 @@ fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Worker
             return;
         }
     };
+    let id = workers.next_result_id();
     let sender = workers.hosts.entry(origin).or_insert_with(|| {
         let (sender, receiver) = mpsc::channel::<HttpRequest>();
         let updates = workers.worker_tx.clone();
@@ -957,8 +1064,6 @@ fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Worker
         });
         sender
     });
-    let id = workers.next_http_id;
-    workers.next_http_id += 1;
     if sender
         .send(HttpRequest {
             id,
@@ -991,7 +1096,11 @@ fn print_help() {
     println!("Live values:");
     println!("  + bash? command     Run and refresh a Bash command as staffer");
     println!("  + zsh? command      Run and refresh a Zsh command as staffer");
-    println!("  +                   Show changes in all live values since the last +");
+    println!("  + HEAD https://...  Check headers now and again when you enter +");
+    println!("  + FEED https://...  Watch an Atom feed; refresh when you enter +");
+    println!("  + https://...       Watch an Atom URL if its Content-Type identifies a feed");
+    println!("  +                   Show added lines from all live values");
+    println!("  +-                  Show added and removed lines from all live values");
     println!("Shared context:");
     println!("  https://...          Load a text resource into session context (background)");
     println!("  HEAD https://...     Show response headers and time to receive them");
@@ -1014,8 +1123,8 @@ fn print_help() {
     println!("  fm?                 Enter fm read-only mode; ., exit, or Ctrl-C returns");
     println!("  git commit -m luna?(Suggest a message)  Use one agent reply as an argument");
     println!("  echo $(date)        Run shell command substitution via Bash or Zsh");
-    println!("  #3, codex#3         Show the full reply from agent request #3");
-    println!("  claude? agree? #3   Include that reply; queue if #3 is still working");
+    println!("  #3, codex#3         Show a numbered HTTP result or full agent reply");
+    println!("  claude? agree? #3   Include a numbered result; queue if an agent is still working");
     println!("  ? task, ! task, and other + forms are not available yet");
     println!("  Unknown name? or name! targets report an Euka error");
     #[cfg(target_os = "macos")]
@@ -1057,8 +1166,18 @@ fn current_username() -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn session_context(session: &Session) -> String {
-    let mut context = format!("cwd: {}\n", session.cwd.display());
+    session_context_filtered(session, &BTreeSet::new(), None, &session.cwd)
+}
+
+fn session_context_filtered(
+    session: &Session,
+    referenced_ids: &BTreeSet<usize>,
+    current_request_id: Option<usize>,
+    cwd: &Path,
+) -> String {
+    let mut context = format!("cwd: {}\n", cwd.display());
     for live in &session.live_commands {
         context.push_str(&format!(
             "live {} in {}:\n{}\n",
@@ -1067,7 +1186,19 @@ fn session_context(session: &Session) -> String {
             live_current_text(live)
         ));
     }
-    for event in session.events.iter().rev().take(20).rev() {
+    let recent_events: Vec<_> = session
+        .events
+        .iter()
+        .rev()
+        .filter(|event| match event {
+            Event::AgentRequest { id, .. } => Some(*id) != current_request_id,
+            Event::AgentResponse { id, .. } => !referenced_ids.contains(id),
+            Event::Resource { id, .. } | Event::HttpHead { id, .. } => !referenced_ids.contains(id),
+            _ => true,
+        })
+        .take(20)
+        .collect();
+    for event in recent_events.into_iter().rev() {
         match event {
             Event::Command { input, status } => {
                 context.push_str(&format!("command: {input} (exit {status})\n"))
@@ -1086,7 +1217,7 @@ fn session_context(session: &Session) -> String {
             Event::AgentResponse { id, model, text } => {
                 context.push_str(&format!("response ({model}#{id}): {text}\n"))
             }
-            Event::Resource(resource) => {
+            Event::Resource { resource, .. } => {
                 context.push_str(&format!(
                     "resource: {} ({})\n",
                     resource.url, resource.content_type
@@ -1094,7 +1225,7 @@ fn session_context(session: &Session) -> String {
                 context.extend(resource.content.chars().take(8_000));
                 context.push('\n');
             }
-            Event::HttpHead { url, output } => {
+            Event::HttpHead { url, output, .. } => {
                 context.push_str(&format!("HEAD {url}:\n{output}\n"));
             }
         }
@@ -1162,9 +1293,31 @@ fn agent_model_by_id(session: &Session, id: usize) -> Option<&str> {
     })
 }
 
-fn referenced_context(task: &str, session: &Session, workers: &Workers) -> Result<String, String> {
+fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
+    session.events.iter().find_map(|event| match event {
+        Event::HttpHead {
+            id: event_id,
+            url,
+            output,
+        } if *event_id == id => Some(format!("HEAD {url}:\n{output}")),
+        Event::Resource {
+            id: event_id,
+            resource,
+        } if *event_id == id => Some(format!(
+            "{} ({}):\n{}",
+            resource.url, resource.content_type, resource.content
+        )),
+        _ => None,
+    })
+}
+
+fn ready_references(
+    task: &str,
+    session: &Session,
+    workers: &Workers,
+) -> Result<ResolvedReferences, String> {
     match resolve_references(task, session, workers)? {
-        ReferenceResolution::Ready(context) => Ok(context),
+        ReferenceResolution::Ready(references) => Ok(references),
         ReferenceResolution::Pending(ids) => {
             let id = ids[0];
             let model = agent_model_by_id(session, id).expect("pending agent has a request");
@@ -1193,9 +1346,16 @@ fn resolve_references(
             }
             Some((model, id))
         } else if let Some(id) = session::agent_number_reference(token) {
-            let model = agent_model_by_id(session, id)
-                .ok_or_else(|| format!("no reply found for #{id}"))?;
-            Some((model, id))
+            if let Some(model) = agent_model_by_id(session, id) {
+                Some((model, id))
+            } else if let Some(text) = http_response_by_id(session, id) {
+                if seen.insert(id) {
+                    context.push_str(&format!("\nReferenced HTTP result #{id}:\n{text}\n"));
+                }
+                None
+            } else {
+                return Err(format!("no reply found for #{id}"));
+            }
         } else {
             None
         };
@@ -1214,7 +1374,10 @@ fn resolve_references(
         }
     }
     if pending.is_empty() {
-        Ok(ReferenceResolution::Ready(context))
+        Ok(ReferenceResolution::Ready(ResolvedReferences {
+            text: context,
+            ids: seen,
+        }))
     } else {
         Ok(ReferenceResolution::Pending(pending.into_iter().collect()))
     }
@@ -1285,12 +1448,19 @@ fn format_worker_update(
                         resource.url,
                         resource.content_type
                     );
-                    session.events.push(Event::Resource(resource));
+                    session.events.push(Event::Resource {
+                        id: update.id,
+                        resource,
+                    });
                     message
                 }
                 Ok(HttpResult::Head { url, output }) => {
                     let message = format!("[head #{}] {url}\n{output}", update.id);
-                    session.events.push(Event::HttpHead { url, output });
+                    session.events.push(Event::HttpHead {
+                        id: update.id,
+                        url,
+                        output,
+                    });
                     message
                 }
                 Err(error) => {
@@ -1335,7 +1505,7 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
         match resolution {
             Ok(ReferenceResolution::Ready(references)) => {
                 let request = workers.queued_agents.remove(&id).unwrap();
-                launch_agent(request, references, workers);
+                launch_agent(request, references, session, workers);
             }
             Ok(ReferenceResolution::Pending(ids)) => {
                 let status = ids
@@ -1382,13 +1552,13 @@ fn one_line(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_response, agent_response_by_id, diff_lines, format_update, highlight_answer,
-        one_line, prompt, referenced_context, render_agent, reset_state, resolve_references,
-        session_context, shortened_path, start_agents, AgentDisplay, AgentUpdate,
-        ReferenceResolution, Workers,
+        agent_context, agent_response, agent_response_by_id, diff_lines, format_update,
+        highlight_answer, one_line, prompt, ready_references, render_agent, reset_state,
+        resolve_references, session_context, shortened_path, start_agents, AgentDisplay,
+        AgentUpdate, ReferenceResolution, Workers,
     };
     use crate::agent_cli::AgentUser;
-    use crate::session::{AgentAccess, Event, PromptMode, Session};
+    use crate::session::{AgentAccess, DiffMode, Event, PromptMode, Session};
     use crate::terminal::Terminal;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1511,11 +1681,15 @@ mod tests {
         }
         assert!(!session_context(&session).contains("multiline finding"));
         assert_eq!(
-            referenced_context("agree? codex#3, codex#3", &session, &workers).unwrap(),
+            ready_references("agree? codex#3, codex#3", &session, &workers)
+                .unwrap()
+                .text,
             "\nReferenced reply codex#3:\nthe full\nmultiline finding\n"
         );
         assert_eq!(
-            referenced_context("agree? #3, codex#3", &session, &workers).unwrap(),
+            ready_references("agree? #3, codex#3", &session, &workers)
+                .unwrap()
+                .text,
             "\nReferenced reply codex#3:\nthe full\nmultiline finding\n"
         );
         assert_eq!(
@@ -1541,11 +1715,11 @@ mod tests {
         });
         workers.pending_agents.insert(3, "codex#3: …".into());
         assert_eq!(
-            referenced_context("agree? codex#3", &session, &workers).unwrap_err(),
+            ready_references("agree? codex#3", &session, &workers).unwrap_err(),
             "codex#3 is still working"
         );
         assert_eq!(
-            referenced_context("agree? #3", &session, &workers).unwrap_err(),
+            ready_references("agree? #3", &session, &workers).unwrap_err(),
             "codex#3 is still working"
         );
         assert_eq!(
@@ -1553,7 +1727,7 @@ mod tests {
             "no reply found for #99"
         );
         assert_eq!(
-            referenced_context("agree? claude#3", &session, &workers).unwrap_err(),
+            ready_references("agree? claude#3", &session, &workers).unwrap_err(),
             "no reply found for claude#3"
         );
     }
@@ -1641,10 +1815,54 @@ mod tests {
         });
         assert!(matches!(
             resolve_references(task, &session, &workers).unwrap(),
-            ReferenceResolution::Ready(context)
-                if context.contains("Referenced reply sol#1:\nfirst")
-                    && context.contains("Referenced reply sol#2:\nsecond")
+            ReferenceResolution::Ready(references)
+                if references.text.contains("Referenced reply sol#1:\nfirst")
+                    && references.text.contains("Referenced reply sol#2:\nsecond")
         ));
+    }
+
+    #[test]
+    fn queued_agent_builds_context_after_reply_and_includes_it_once() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        workers.next_agent_id = 3;
+        session.events.push(Event::AgentRequest {
+            id: 2,
+            input: "inspect".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("sol".into()),
+        });
+        workers.pending_agents.insert(2, "sol#2: …".into());
+        start_agents(
+            "summarize #2",
+            AgentAccess::ReadOnly,
+            &["luna"],
+            AgentUser::Current,
+            &mut session,
+            &mut workers,
+        );
+        let request_cwd = session.cwd.clone();
+        session.cwd = Path::new("/tmp/changed-while-waiting").into();
+        session
+            .events
+            .push(Event::Comment("added while waiting".into()));
+        session.events.push(Event::AgentResponse {
+            id: 2,
+            model: "sol".into(),
+            text: "unique reply".into(),
+        });
+        workers.pending_agents.remove(&2);
+        let ReferenceResolution::Ready(references) =
+            resolve_references("summarize #2", &session, &workers).unwrap()
+        else {
+            panic!("reference should be ready");
+        };
+        let context = agent_context(&session, &workers.queued_agents[&3], &references);
+        assert!(context.starts_with(&format!("cwd: {}\n", request_cwd.display())));
+        assert!(context.contains("comment: added while waiting"));
+        assert_eq!(context.matches("unique reply").count(), 1);
+        assert!(!context.contains("response (sol#2):"));
+        assert_eq!(context.matches("request (luna#3").count(), 1);
     }
 
     #[test]
@@ -1665,10 +1883,49 @@ mod tests {
     }
 
     #[test]
-    fn live_diff_marks_removed_and_added_status_lines() {
+    fn live_diff_modes_show_only_requested_lines() {
         assert_eq!(
-            diff_lines("## main\n?? old", "## main\n?? new"),
-            "--- last +\n+++ now\n ## main\n-?? old\n+?? new"
+            diff_lines("## main\n?? old", "## main\n?? new", DiffMode::Added),
+            "+?? new"
         );
+        assert_eq!(
+            diff_lines(
+                "## main\n?? old",
+                "## main\n?? new",
+                DiffMode::AddedAndRemoved
+            ),
+            "-?? old\n+?? new"
+        );
+        assert_eq!(diff_lines("old", "", DiffMode::Added), "");
+        assert_eq!(diff_lines("old", "", DiffMode::AddedAndRemoved), "-old");
+    }
+
+    #[test]
+    fn completed_head_result_is_available_to_agent_references() {
+        let mut session = Session::new().unwrap();
+        session.events.push(Event::HttpHead {
+            id: 2,
+            url: "https://example.com/feed.atom".into(),
+            output: "HTTP 200\ncontent-type: application/atom+xml".into(),
+        });
+        let workers = Workers::new(false);
+        let references = ready_references("Summarize #2", &session, &workers).unwrap();
+        assert!(references.text.contains("Referenced HTTP result #2:"));
+        assert!(references.text.contains("HTTP 200"));
+        assert!(super::http_response_by_id(&session, 2)
+            .unwrap()
+            .contains("feed.atom"));
+        let context =
+            super::session_context_filtered(&session, &references.ids, None, &session.cwd);
+        assert!(!context.contains("HEAD https://example.com/feed.atom"));
+    }
+
+    #[test]
+    fn agents_and_http_results_share_numbers() {
+        let mut workers = Workers::new(false);
+        assert_eq!(workers.next_result_id(), 1);
+        assert_eq!(workers.next_result_id(), 2);
+        assert_eq!(workers.next_agent_id, 3);
+        assert_eq!(workers.next_http_id, 3);
     }
 }

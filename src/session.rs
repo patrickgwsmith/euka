@@ -17,6 +17,18 @@ pub enum PromptMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffMode {
+    Added,
+    AddedAndRemoved,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FeedSelection {
+    Explicit,
+    ContentType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentAccess {
     ReadOnly,
     ReadWrite,
@@ -41,17 +53,38 @@ impl AgentAccess {
 pub struct LiveCommand {
     pub id: usize,
     pub cwd: PathBuf,
-    pub program: &'static str,
-    pub command: String,
+    pub target: LiveTarget,
     pub output: String,
     pub error: Option<String>,
     pub last_run: Option<String>,
     pub last_refresh: Instant,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum LiveTarget {
+    Shell {
+        program: &'static str,
+        command: String,
+    },
+    Head {
+        url: String,
+    },
+    Feed {
+        url: String,
+        selection: FeedSelection,
+    },
+}
+
 impl LiveCommand {
     pub fn label(&self) -> String {
-        format!("+ {}? {}", self.program, self.command)
+        match &self.target {
+            LiveTarget::Shell { program, command } => format!("+ {program}? {command}"),
+            LiveTarget::Head { url } => format!("+ HEAD {url}"),
+            LiveTarget::Feed { url, selection } => match selection {
+                FeedSelection::Explicit => format!("+ FEED {url}"),
+                FeedSelection::ContentType => format!("+ {url}"),
+            },
+        }
     }
 }
 
@@ -79,8 +112,12 @@ pub enum Event {
         model: String,
         text: String,
     },
-    Resource(Resource),
+    Resource {
+        id: usize,
+        resource: Resource,
+    },
     HttpHead {
+        id: usize,
         url: String,
         output: String,
     },
@@ -100,7 +137,9 @@ pub enum Input<'a> {
         program: &'static str,
         command: &'a str,
     },
-    LiveDiff,
+    LiveHead(&'a str),
+    LiveFeed(&'a str, FeedSelection),
+    LiveDiff(DiffMode),
     Url(&'a str),
     Head(&'a str),
     EnterFm,
@@ -153,7 +192,27 @@ pub fn classify(line: &str) -> Input<'_> {
     } else if line.trim_end() == "?" {
         Input::Help
     } else if line.trim_end() == "+" {
-        Input::LiveDiff
+        Input::LiveDiff(DiffMode::Added)
+    } else if line.trim_end() == "+-" {
+        Input::LiveDiff(DiffMode::AddedAndRemoved)
+    } else if let Some(url) = line
+        .strip_prefix('+')
+        .and_then(|rest| rest.trim_start().strip_prefix("HEAD"))
+        .and_then(agent_task)
+    {
+        Input::LiveHead(url)
+    } else if let Some(url) = line
+        .strip_prefix('+')
+        .and_then(|rest| rest.trim_start().strip_prefix("FEED"))
+        .and_then(agent_task)
+    {
+        Input::LiveFeed(url, FeedSelection::Explicit)
+    } else if let Some(url) = line
+        .strip_prefix('+')
+        .map(str::trim_start)
+        .filter(|rest| rest.starts_with("https://") || rest.starts_with("http://"))
+    {
+        Input::LiveFeed(url.trim_end(), FeedSelection::ContentType)
     } else if let Some(rest) = line.strip_prefix("- [ ] ") {
         Input::Todo(rest)
     } else if let Some(command) = line
@@ -319,7 +378,7 @@ fn shell_target<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_number_reference, agent_reference, classify, AgentAccess, Input};
+    use super::{agent_number_reference, agent_reference, classify, AgentAccess, DiffMode, Input};
 
     #[test]
     fn agent_reply_reference_is_explicit_syntax() {
@@ -506,8 +565,15 @@ mod tests {
 
     #[test]
     fn live_shell_commands_are_classified() {
-        assert!(matches!(classify("+"), Input::LiveDiff));
-        assert!(matches!(classify("  +  "), Input::LiveDiff));
+        assert!(matches!(classify("+"), Input::LiveDiff(DiffMode::Added)));
+        assert!(matches!(
+            classify("  +  "),
+            Input::LiveDiff(DiffMode::Added)
+        ));
+        assert!(matches!(
+            classify("+-"),
+            Input::LiveDiff(DiffMode::AddedAndRemoved)
+        ));
         assert!(matches!(
             classify("+ bash? git status"),
             Input::LiveHostShell {
@@ -536,6 +602,48 @@ mod tests {
         assert!(matches!(
             classify("+ git log"),
             Input::Reserved("+ git log")
+        ));
+    }
+
+    #[test]
+    fn live_head_is_classified_and_labeled() {
+        assert!(matches!(
+            classify("+ HEAD https://github.com/patrickgwsmith/euka"),
+            Input::LiveHead("https://github.com/patrickgwsmith/euka")
+        ));
+        assert!(matches!(
+            classify("+HEAD https://example.com/"),
+            Input::LiveHead("https://example.com/")
+        ));
+        let live = super::LiveCommand {
+            id: 1,
+            cwd: std::path::PathBuf::from("/tmp"),
+            target: super::LiveTarget::Head {
+                url: "https://example.com/".into(),
+            },
+            output: String::new(),
+            error: None,
+            last_run: None,
+            last_refresh: std::time::Instant::now(),
+        };
+        assert_eq!(live.label(), "+ HEAD https://example.com/");
+    }
+
+    #[test]
+    fn atom_urls_can_be_watched_explicitly_or_by_content_type() {
+        assert!(matches!(
+            classify("+ FEED https://example.com/main.atom"),
+            Input::LiveFeed(
+                "https://example.com/main.atom",
+                super::FeedSelection::Explicit
+            )
+        ));
+        assert!(matches!(
+            classify("+ https://example.com/main.atom"),
+            Input::LiveFeed(
+                "https://example.com/main.atom",
+                super::FeedSelection::ContentType
+            )
         ));
     }
 
