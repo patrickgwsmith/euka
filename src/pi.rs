@@ -1,0 +1,35 @@
+use crate::agent_cli::AgentUser;
+use crate::session::AgentAccess;
+use std::path::Path;
+
+pub fn run(
+    task: &str,
+    cwd: &Path,
+    context: &str,
+    access: AgentAccess,
+    user: AgentUser,
+) -> Result<String, String> {
+    super::agent_cli::run(
+        "pi",
+        &[
+            "--print",
+            "--no-session",
+            "--no-extensions",
+            "--no-approve",
+            "--tools",
+            match access {
+                AgentAccess::ReadOnly => "read,grep,find,ls",
+                AgentAccess::ReadWrite => "read,grep,find,ls,edit,write,bash",
+            },
+            match access {
+                AgentAccess::ReadOnly => "Answer the Euka user request supplied on stdin. Use the Euka session context and inspect project files as needed. Do not change files.",
+                AgentAccess::ReadWrite => "Carry out the Euka user request supplied on stdin. Use the Euka session context and project files as needed. You may change files and run commands.",
+            },
+        ],
+        task,
+        cwd,
+        context,
+        user,
+        access,
+    )
+}

@@ -1,0 +1,11 @@
+[package]
+name = "euka"
+version = "0.1.0"
+edition = "2021"
+description = "A small shared shell for humans and coding agents"
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"
+ureq = "3"
+unicode-width = "0.2"
