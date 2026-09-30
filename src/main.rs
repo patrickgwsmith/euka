@@ -13,9 +13,9 @@ mod terminal;
 use agent_cli::AgentUser;
 use session::{AgentAccess, Event, Input, LiveCommand, PromptMode, Resource, Session};
 use shell::Outcome;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +29,22 @@ struct AgentUpdate {
     model: String,
     access: AgentAccess,
     result: Result<String, String>,
+}
+
+struct QueuedAgent {
+    id: usize,
+    model: String,
+    task: String,
+    cwd: PathBuf,
+    base_context: String,
+    answer_chars: usize,
+    access: AgentAccess,
+    user: AgentUser,
+}
+
+enum ReferenceResolution {
+    Ready(String),
+    Pending(Vec<usize>),
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +72,72 @@ fn render_agent(model: &str, id: usize, display: AgentDisplay<'_>) -> String {
             } else {
                 format!("{prefix} {text}")
             }
+        }
+    }
+}
+
+fn output_color() -> bool {
+    (unsafe { libc::isatty(1) == 1 })
+        && !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+        && std::env::var("TERM").ok().as_deref() != Some("dumb")
+}
+
+fn render_agent_output(model: &str, id: usize, display: AgentDisplay<'_>) -> String {
+    let plain = render_agent(model, id, display);
+    if !output_color() || matches!(display, AgentDisplay::Working) {
+        return plain;
+    }
+    let label = format!("{model}#{id}:");
+    if let Some(body) = plain.strip_prefix(&format!("{label} error: ")) {
+        return format!("\x1b[1;31m{label} error:\x1b[0m {body}");
+    }
+    if let Some(body) = plain.strip_prefix(&format!("{label} ")) {
+        return format!("\x1b[1;35m{label}\x1b[0m {}", highlight_answer(body));
+    }
+    plain
+}
+
+fn highlight_answer(text: &str) -> String {
+    let mut result = String::new();
+    for line in text.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+        result.push_str(&line[..indent]);
+        let rest = &line[indent..];
+        if let Some(body) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+            result.push_str("\x1b[36m•\x1b[0m ");
+            highlight_inline(body, &mut result);
+        } else {
+            highlight_inline(rest, &mut result);
+        }
+    }
+    result
+}
+
+fn highlight_inline(mut text: &str, output: &mut String) {
+    while !text.is_empty() {
+        let bold = text.find("**").map(|at| (at, "**", "\x1b[1;36m"));
+        let code = text.find('`').map(|at| (at, "`", "\x1b[36m"));
+        let marker = match (bold, code) {
+            (Some(bold), Some(code)) if bold.0 <= code.0 => Some(bold),
+            (Some(_), Some(code)) => Some(code),
+            (Some(bold), None) => Some(bold),
+            (None, Some(code)) => Some(code),
+            (None, None) => None,
+        };
+        let Some((at, delimiter, style)) = marker else {
+            output.push_str(text);
+            return;
+        };
+        output.push_str(&text[..at]);
+        let after = &text[at + delimiter.len()..];
+        if let Some(end) = after.find(delimiter) {
+            output.push_str(style);
+            output.push_str(&after[..end]);
+            output.push_str("\x1b[0m");
+            text = &after[end + delimiter.len()..];
+        } else {
+            output.push_str(delimiter);
+            text = after;
         }
     }
 }
@@ -95,6 +177,7 @@ struct Workers {
     next_agent_id: usize,
     active_agents: usize,
     pending_agents: BTreeMap<usize, String>,
+    queued_agents: BTreeMap<usize, QueuedAgent>,
     interactive: bool,
     next_http_id: usize,
     active_http: usize,
@@ -115,6 +198,7 @@ impl Workers {
             next_agent_id: 1,
             active_agents: 0,
             pending_agents: BTreeMap::new(),
+            queued_agents: BTreeMap::new(),
             interactive,
             next_http_id: 1,
             active_http: 0,
@@ -151,9 +235,7 @@ fn main() {
             }
         }
         loop {
-            let color = unsafe { libc::isatty(1) == 1 }
-                && !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
-                && std::env::var("TERM").ok().as_deref() != Some("dumb");
+            let color = output_color();
             let short_prompt = prompt(session.mode, &session.cwd, false, color);
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
             let statuses = workers.pending_agents.values().cloned().collect();
@@ -403,7 +485,7 @@ fn handle(
             Ok(text) => {
                 println!(
                     "{}",
-                    render_agent(model, id, AgentDisplay::FullAnswer(text))
+                    render_agent_output(model, id, AgentDisplay::FullAnswer(text))
                 );
                 session.last_status = 0;
             }
@@ -416,7 +498,7 @@ fn handle(
             Ok((model, text)) => {
                 println!(
                     "{}",
-                    render_agent(model, id, AgentDisplay::FullAnswer(text))
+                    render_agent_output(model, id, AgentDisplay::FullAnswer(text))
                 );
                 session.last_status = 0;
             }
@@ -569,7 +651,10 @@ fn resolve_inline(
                     model: model.to_owned(),
                     text: answer.clone(),
                 });
-                println!("{}", render_agent(model, id, AgentDisplay::Answer(&answer)));
+                println!(
+                    "{}",
+                    render_agent_output(model, id, AgentDisplay::Answer(&answer))
+                );
                 resolved.push_str(&quoted);
             }
         }
@@ -598,7 +683,7 @@ fn start_agents(
         session.last_status = 1;
         return;
     }
-    let references = match referenced_context(task, session, workers) {
+    let references = match resolve_references(task, session, workers) {
         Ok(references) => references,
         Err(error) => {
             eprintln!("euka: {error}");
@@ -617,50 +702,85 @@ fn start_agents(
             access,
             model: Some(model.to_owned()),
         });
-        let task = task.to_owned();
-        let cwd = session.cwd.clone();
-        let mut context = base_context.clone();
-        let username = match user {
-            AgentUser::Current => "current user",
-            AgentUser::Staffer => "staffer",
-        };
-        context.push_str(&format!(
-            "request ({model}#{id}, {}, {username}): {task}\n",
-            access.description()
-        ));
-        context.push_str(&references);
-        let references = references.clone();
-        let model = model.to_owned();
-        let worker_model = model.clone();
         let answer_chars = terminal::columns()
             .saturating_sub(format!("{model}#{id}: ").chars().count() + 1)
             .max(1);
-        let tx = workers.worker_tx.clone();
-        std::thread::spawn(move || {
-            let result = run_agent(
-                &worker_model,
-                &task,
-                &cwd,
-                &context,
-                &references,
-                answer_chars,
-                access,
-                user,
-            );
-            let _ = tx.send(WorkerUpdate::Agent(AgentUpdate {
-                id,
-                model: worker_model,
-                access,
-                result,
-            }));
-        });
-        let status = render_agent(&model, id, AgentDisplay::Working);
-        workers.pending_agents.insert(id, status.clone());
+        let request = QueuedAgent {
+            id,
+            model: model.to_owned(),
+            task: task.to_owned(),
+            cwd: session.cwd.clone(),
+            base_context: base_context.clone(),
+            answer_chars,
+            access,
+            user,
+        };
+        let status = match &references {
+            ReferenceResolution::Ready(context) => {
+                launch_agent(request, context.clone(), workers);
+                render_agent(model, id, AgentDisplay::Working)
+            }
+            ReferenceResolution::Pending(ids) => {
+                let waiting_for = ids
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let status = format!("{model}#{id}: waiting for {waiting_for}");
+                workers.pending_agents.insert(id, status.clone());
+                workers.queued_agents.insert(id, request);
+                status
+            }
+        };
         if !workers.interactive {
             println!("{status}");
         }
     }
     session.last_status = 0;
+}
+
+fn launch_agent(request: QueuedAgent, references: String, workers: &mut Workers) {
+    let QueuedAgent {
+        id,
+        model,
+        task,
+        cwd,
+        mut base_context,
+        answer_chars,
+        access,
+        user,
+    } = request;
+    let username = match user {
+        AgentUser::Current => "current user",
+        AgentUser::Staffer => "staffer",
+    };
+    base_context.push_str(&format!(
+        "request ({model}#{id}, {}, {username}): {task}\n",
+        access.description()
+    ));
+    base_context.push_str(&references);
+    workers
+        .pending_agents
+        .insert(id, render_agent(&model, id, AgentDisplay::Working));
+    let tx = workers.worker_tx.clone();
+    std::thread::spawn(move || {
+        let result = run_agent(
+            &model,
+            &task,
+            &cwd,
+            &base_context,
+            &references,
+            answer_chars,
+            access,
+            user,
+        );
+        let _ = tx.send(WorkerUpdate::Agent(AgentUpdate {
+            id,
+            model,
+            access,
+            result,
+        }));
+    });
 }
 
 fn start_live_command(
@@ -895,7 +1015,7 @@ fn print_help() {
     println!("  git commit -m luna?(Suggest a message)  Use one agent reply as an argument");
     println!("  echo $(date)        Run shell command substitution via Bash or Zsh");
     println!("  #3, codex#3         Show the full reply from agent request #3");
-    println!("  claude? agree? #3   Include that reply in a new agent request");
+    println!("  claude? agree? #3   Include that reply; queue if #3 is still working");
     println!("  ? task, ! task, and other + forms are not available yet");
     println!("  Unknown name? or name! targets report an Euka error");
     #[cfg(target_os = "macos")]
@@ -1025,22 +1145,42 @@ fn agent_response_by_id<'a>(
     id: usize,
     workers: &Workers,
 ) -> Result<(&'a str, &'a str), String> {
-    let model = session.events.iter().find_map(|event| match event {
+    let model =
+        agent_model_by_id(session, id).ok_or_else(|| format!("no reply found for #{id}"))?;
+    let text = agent_response(session, model, id, workers)?;
+    Ok((model, text))
+}
+
+fn agent_model_by_id(session: &Session, id: usize) -> Option<&str> {
+    session.events.iter().find_map(|event| match event {
         Event::AgentRequest {
             id: request_id,
             model: Some(model),
             ..
         } if *request_id == id => Some(model.as_str()),
         _ => None,
-    });
-    let model = model.ok_or_else(|| format!("no reply found for #{id}"))?;
-    let text = agent_response(session, model, id, workers)?;
-    Ok((model, text))
+    })
 }
 
 fn referenced_context(task: &str, session: &Session, workers: &Workers) -> Result<String, String> {
+    match resolve_references(task, session, workers)? {
+        ReferenceResolution::Ready(context) => Ok(context),
+        ReferenceResolution::Pending(ids) => {
+            let id = ids[0];
+            let model = agent_model_by_id(session, id).expect("pending agent has a request");
+            Err(format!("{model}#{id} is still working"))
+        }
+    }
+}
+
+fn resolve_references(
+    task: &str,
+    session: &Session,
+    workers: &Workers,
+) -> Result<ReferenceResolution, String> {
     let mut context = String::new();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = BTreeSet::new();
     for token in task.split(|character: char| {
         !(character.is_ascii_alphanumeric()
             || character == '#'
@@ -1048,21 +1188,36 @@ fn referenced_context(task: &str, session: &Session, workers: &Workers) -> Resul
             || character == '-')
     }) {
         let reference = if let Some((model, id)) = session::agent_reference(token) {
+            if agent_model_by_id(session, id) != Some(model) {
+                return Err(format!("no reply found for {model}#{id}"));
+            }
             Some((model, id))
         } else if let Some(id) = session::agent_number_reference(token) {
-            let (model, _) = agent_response_by_id(session, id, workers)?;
+            let model = agent_model_by_id(session, id)
+                .ok_or_else(|| format!("no reply found for #{id}"))?;
             Some((model, id))
         } else {
             None
         };
         if let Some((model, id)) = reference {
             if seen.insert(id) {
-                let text = agent_response(session, model, id, workers)?;
-                context.push_str(&format!("\nReferenced reply {model}#{id}:\n{text}\n"));
+                match agent_response(session, model, id, workers) {
+                    Ok(text) => {
+                        context.push_str(&format!("\nReferenced reply {model}#{id}:\n{text}\n"));
+                    }
+                    Err(_) if workers.pending_agents.contains_key(&id) => {
+                        pending.insert(id);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
-    Ok(context)
+    if pending.is_empty() {
+        Ok(ReferenceResolution::Ready(context))
+    } else {
+        Ok(ReferenceResolution::Pending(pending.into_iter().collect()))
+    }
 }
 
 fn drain_updates(workers: &mut Workers, session: &mut Session) -> Vec<String> {
@@ -1151,7 +1306,7 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
     workers.active_agents = workers.active_agents.saturating_sub(1);
     workers.pending_agents.remove(&update.id);
     let model = update.model;
-    match update.result {
+    let line = match update.result {
         Ok(text) => {
             session.events.push(Event::AgentResponse {
                 id: update.id,
@@ -1162,9 +1317,46 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
                 AgentAccess::ReadOnly => AgentDisplay::Answer(&text),
                 AgentAccess::ReadWrite => AgentDisplay::FullAnswer(&text),
             };
-            render_agent(&model, update.id, display)
+            render_agent_output(&model, update.id, display)
         }
-        Err(error) => render_agent(&model, update.id, AgentDisplay::Error(&error)),
+        Err(error) => render_agent_output(&model, update.id, AgentDisplay::Error(&error)),
+    };
+    resume_queued_agents(session, workers);
+    line
+}
+
+fn resume_queued_agents(session: &Session, workers: &mut Workers) {
+    let ids: Vec<usize> = workers.queued_agents.keys().copied().collect();
+    for id in ids {
+        let Some(request) = workers.queued_agents.get(&id) else {
+            continue;
+        };
+        let resolution = resolve_references(&request.task, session, workers);
+        match resolution {
+            Ok(ReferenceResolution::Ready(references)) => {
+                let request = workers.queued_agents.remove(&id).unwrap();
+                launch_agent(request, references, workers);
+            }
+            Ok(ReferenceResolution::Pending(ids)) => {
+                let status = ids
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                workers
+                    .pending_agents
+                    .insert(id, format!("{}#{id}: waiting for {status}", request.model));
+            }
+            Err(error) => {
+                let request = workers.queued_agents.remove(&id).unwrap();
+                let _ = workers.worker_tx.send(WorkerUpdate::Agent(AgentUpdate {
+                    id,
+                    model: request.model,
+                    access: request.access,
+                    result: Err(format!("referenced reply unavailable: {error}")),
+                }));
+            }
+        }
     }
 }
 
@@ -1190,9 +1382,11 @@ fn one_line(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_response, agent_response_by_id, diff_lines, one_line, prompt, referenced_context,
-        render_agent, reset_state, session_context, shortened_path, AgentDisplay, Workers,
+        agent_response, agent_response_by_id, diff_lines, format_update, highlight_answer,
+        one_line, prompt, referenced_context, render_agent, reset_state, session_context,
+        shortened_path, start_agents, AgentDisplay, AgentUpdate, Workers,
     };
+    use crate::agent_cli::AgentUser;
     use crate::session::{AgentAccess, Event, PromptMode, Session};
     use crate::terminal::Terminal;
     use std::path::Path;
@@ -1360,6 +1554,61 @@ mod tests {
         assert_eq!(
             referenced_context("agree? claude#3", &session, &workers).unwrap_err(),
             "no reply found for claude#3"
+        );
+    }
+
+    #[test]
+    fn pending_reply_queues_followup_and_failed_reply_cancels_it() {
+        let mut session = Session::new().unwrap();
+        let mut workers = Workers::new(false);
+        workers.next_agent_id = 3;
+        workers.active_agents = 1;
+        workers.pending_agents.insert(2, "sol#2: …".into());
+        session.events.push(Event::AgentRequest {
+            id: 2,
+            input: "inspect".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("sol".into()),
+        });
+
+        start_agents(
+            "summarize #2",
+            AgentAccess::ReadOnly,
+            &["luna"],
+            AgentUser::Current,
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(
+            workers.pending_agents.get(&3).unwrap(),
+            "luna#3: waiting for #2"
+        );
+        assert!(workers.queued_agents.contains_key(&3));
+        assert_eq!(workers.active_agents, 2);
+
+        format_update(
+            AgentUpdate {
+                id: 2,
+                model: "sol".into(),
+                access: AgentAccess::ReadOnly,
+                result: Err("failed".into()),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert!(!workers.queued_agents.contains_key(&3));
+        let update = workers.worker_rx.try_recv().unwrap();
+        let line = super::format_worker_update(update, &mut session, &mut workers);
+        assert!(line.contains("referenced reply unavailable: sol#2 has no reply"));
+        assert!(workers.pending_agents.is_empty());
+        assert_eq!(workers.active_agents, 0);
+    }
+
+    #[test]
+    fn agent_results_highlight_bold_bullets_and_code() {
+        assert_eq!(
+            highlight_answer("**Checks and additions**\n- I checked `src/terminal.rs`"),
+            "\x1b[1;36mChecks and additions\x1b[0m\n\x1b[36m•\x1b[0m I checked \x1b[36msrc/terminal.rs\x1b[0m"
         );
     }
 
