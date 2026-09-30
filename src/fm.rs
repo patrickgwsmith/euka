@@ -206,10 +206,10 @@ fn run_with(
             continue;
         }
         let result = match action {
-            "list" => list(&root, path),
-            "read" => read(&root, path),
-            "write" if access == AgentAccess::ReadWrite => write(&root, path, text),
-            "run" if access == AgentAccess::ReadWrite => run_command(&root, text),
+            "list" => list(root, path),
+            "read" => read(root, path),
+            "write" if access == AgentAccess::ReadWrite => write(root, path, text),
+            "run" if access == AgentAccess::ReadWrite => run_command(root, text),
             _ => Err("tool denied for this request".into()),
         };
         let result = match result {

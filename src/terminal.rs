@@ -67,6 +67,29 @@ pub fn clear_screen() -> io::Result<()> {
     stdout.flush()
 }
 
+pub fn set_title(title: &str) -> io::Result<()> {
+    if std::env::var("TERM").ok().as_deref() == Some("dumb") {
+        return Ok(());
+    }
+    let mut stdout = io::stdout().lock();
+    write_title(&mut stdout, title)?;
+    stdout.flush()
+}
+
+fn write_title(output: &mut impl Write, title: &str) -> io::Result<()> {
+    let title: String = title
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect();
+    write!(output, "\x1b]2;{title}\x1b\\")
+}
+
 impl Terminal {
     pub fn new() -> Self {
         Self {
@@ -643,7 +666,7 @@ fn write_input(mut output: impl Write, line: &str, color: bool) -> io::Result<()
             if &line[start..end] == "@staffer" {
                 return write_input(output, &line[end..], color);
             }
-            output.write_all(line[end..].as_bytes())?;
+            output.write_all(&line.as_bytes()[end..])?;
             return Ok(());
         }
     }
@@ -921,10 +944,18 @@ fn common_prefix(strings: &[String]) -> String {
 mod tests {
     use super::{
         backward_word, clear_editor, completions_in, forward_word, kill, selector_highlight,
-        write_input, write_notices, write_wrapped, EditorDisplay, KillDirection, SelectorKind,
+        write_input, write_notices, write_title, write_wrapped, EditorDisplay, KillDirection,
+        SelectorKind,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn terminal_title_uses_short_path_and_filters_control_sequences() {
+        let mut output = Vec::new();
+        write_title(&mut output, "~/C/project\x1b]0;injected\x07").unwrap();
+        assert_eq!(output, b"\x1b]2;~/C/project?]0;injected?\x1b\\");
+    }
 
     #[test]
     fn recognized_selectors_have_distinct_colors() {

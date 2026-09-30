@@ -11,7 +11,7 @@ A coding agent can usually change all the files in your project. Euka gives you 
 - Each agent request has a suffix. The suffix sets the access level of the request.
   - `?` gives read-only access. The agent can read files, but it cannot change them.
   - `!` gives read-write access. The agent can change files and run commands.
-- On macOS, a system sandbox prevents writes to your project during `?` requests. This protection stays on if the agent's own restrictions fail.
+- On macOS, a system sandbox prevents file writes during `?` requests, except to temporary directories and the agent's own state. This protection stays on if the agent's own restrictions fail.
 - You can run agents and shell commands as a separate Unix user, `staffer`. This user has less access than your own account.
 - All agents share one session. An agent can see your notes, your commands, and the answers from other agents.
 
@@ -26,9 +26,9 @@ Euka does not give full protection. Read [Limits of the protection](#limits-of-t
 
 ## Build and run
 
-1. To build and start Euka, run `cargo run`.
-2. To show help and exit, run `cargo run -- --help`.
-3. At the Euka prompt, enter `?` to show a cheatsheet of prefixes and built-in commands. On macOS, the cheatsheet also shows the command that creates the `staffer` account.
+Run `make` to rebuild both debug and release binaries. Use `make debug` or `make release` for just one, and `make test` to run the tests. The binaries are at `target/debug/euka` and `target/release/euka`.
+
+To build and start Euka in one step, run `cargo run`. Run `cargo run -- --help` to show help and exit. At the Euka prompt, enter `?` to show a cheatsheet of prefixes and built-in commands. On macOS, the cheatsheet also shows the command that creates the `staffer` account.
 
 ## Agent requests
 
@@ -60,7 +60,7 @@ For a `?` request, Euka uses these restrictions:
 - **Claude Code:** Euka uses restricted mode and an explicit list of tools.
 - **Pi:** Euka uses an explicit list of tools.
 - **fm:** Euka controls the tools. The agent can list directories and read files in the current directory. It cannot write files or run commands.
-- **macOS system sandbox:** For Claude Code, Codex, and Pi, a macOS sandbox prevents writes to the current Git working tree. Outside a Git repository, it prevents writes to the current directory. This sandbox also protects the Git index.
+- **macOS system sandbox:** For Claude Code, Codex, and Pi, a macOS sandbox denies all file writes except to `/dev`, the temporary directories (`/tmp` and `/var/folders`), and the agent user's `~/.claude`, `~/.claude.json*`, `~/.codex`, `~/.pi`, `~/.cache`, and `~/Library/Caches`. This protects your project, its Git index, other repositories, and the rest of your home directory.
 
 For a `!` request, Codex uses its `workspace-write` sandbox. Other agents can write files and run commands.
 
@@ -99,6 +99,7 @@ Each request gets a label, for example `codex#3`. Numbers are unique across all 
 - When the request starts, Euka shows `codex#3: …`.
 - When the answer is ready, Euka shows `codex#3: answer`.
 - To show the full answer, enter `#3` or `codex#3`.
+- Claude and Codex read-only agents are asked for a concise one-line answer. Euka displays their replies without clipping; long lines wrap on screen.
 - To give an answer to a different agent, refer to it in the request. For example: `claude? do you agree with #3?`
 - If a request refers to an unfinished answer, Euka queues it in the background, shows `waiting for #3`, and starts it when the answer arrives. A request with several references waits for all of them. Euka builds the queued request's context after those answers enter the session log and includes each referenced answer once. If a referenced request fails, the queued request reports the failure.
 - Entering `#3` by itself while it is still running reports that it is still in progress.
@@ -213,6 +214,8 @@ Enter `reset` to clear:
 
 The prompt shows a short form of the current directory. It shows the first character of each parent directory and the full name of the current directory. It shows your home directory as `~`. For example, Euka shows `/Users/pgwsmith/Collected/euka` as `~/C/euka>`.
 
+In an interactive terminal, Euka sets the terminal title to the same shortened directory path shown in the prompt and updates it after `cd` or a child command changes the title.
+
 To show the full path for three seconds, press Down at an empty prompt.
 
 Colors help you see the access level before you press Enter:
@@ -245,7 +248,7 @@ Tab completion accepts relative paths, absolute paths, and paths that start with
 
 ## Limits of the protection
 
-- The macOS sandbox prevents writes only in the current Git working tree, or the current directory. A `?` agent can write to other locations.
+- The macOS sandbox still lets a `?` agent write to temporary directories and to the agent CLIs' own state and cache directories in the agent user's home directory.
 - On Linux, `?` requests use only the restrictions of each agent CLI. Euka does not add a system sandbox.
 - `!` requests can change files and run commands.
 - `bash?`, `zsh?`, and `@staffer` have all the access of the `staffer` user.

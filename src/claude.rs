@@ -1,8 +1,6 @@
 use crate::agent_cli::{self, AgentUser};
 use crate::session::AgentAccess;
-use std::io::Write;
 use std::path::Path;
-use std::process::Stdio;
 
 const PROMPT: &str = "Answer the Euka user request supplied on stdin. Use the Euka session context and inspect project files as needed.";
 
@@ -10,15 +8,11 @@ pub fn run(
     task: &str,
     cwd: &Path,
     context: &str,
-    answer_chars: usize,
     model: Option<&str>,
     access: AgentAccess,
     user: AgentUser,
 ) -> Result<String, String> {
-    let format_prompt = format!(
-        "Answer in one concise plain-text line of at most {answer_chars} characters. Give the finding directly; omit headings and markdown."
-    );
-    let mut command = agent_cli::workspace_command("claude", user, cwd, access)?;
+    let mut command = agent_cli::workspace_command("claude", user, access)?;
     let tools = match access {
         AgentAccess::ReadOnly => "Read,Glob,Grep",
         AgentAccess::ReadWrite => "Read,Glob,Grep,Edit,Write,Bash",
@@ -42,7 +36,7 @@ pub fn run(
         "json",
     ]);
     let instruction = match access {
-        AgentAccess::ReadOnly => format_prompt,
+        AgentAccess::ReadOnly => agent_cli::READ_ONLY_REPLY_INSTRUCTION.to_owned(),
         AgentAccess::ReadWrite => "Carry out the user's task and report what changed.".to_owned(),
     };
     command.args([
@@ -54,24 +48,9 @@ pub fn run(
     if let Some(model) = model {
         command.args(["--model", model]);
     }
-    let mut child = command
-        .arg(PROMPT)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("claude: {error}"))?;
-    let input = format!("Euka session context:\n{context}\nUser request:\n{task}\n");
-    child
-        .stdin
-        .take()
-        .ok_or("claude stdin unavailable")?
-        .write_all(input.as_bytes())
-        .map_err(|error| format!("claude stdin: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("claude: {error}"))?;
+    command.arg(PROMPT).current_dir(cwd);
+    let output =
+        agent_cli::run_with_input(command, "claude", agent_cli::session_input(context, task))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("claude {}: {}", output.status, stderr.trim()));

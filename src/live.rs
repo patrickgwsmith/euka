@@ -68,8 +68,7 @@ fn read_capped(mut pipe: impl Read) -> io::Result<(Vec<u8>, bool)> {
 
 fn limit(text: &str) -> String {
     let mut result = String::new();
-    let mut lines = 0;
-    for line in text.lines() {
+    for (lines, line) in text.lines().enumerate() {
         if lines == MAX_LIVE_LINES {
             result.push_str("\n... output truncated");
             break;
@@ -91,7 +90,6 @@ fn limit(text: &str) -> String {
             result.push('\n');
         }
         result.push_str(line);
-        lines += 1;
     }
     result
 }

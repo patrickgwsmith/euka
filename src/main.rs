@@ -38,7 +38,6 @@ struct QueuedAgent {
     model: String,
     task: String,
     cwd: PathBuf,
-    answer_chars: usize,
     access: AgentAccess,
     user: AgentUser,
 }
@@ -66,26 +65,16 @@ fn render_agent(model: &str, id: usize, display: AgentDisplay<'_>) -> String {
     let label = format!("{model}#{id}:");
     match display {
         AgentDisplay::Working => format!("{label} …"),
-        AgentDisplay::FullAnswer(text) => format!("{label} {text}"),
-        AgentDisplay::Answer(text) | AgentDisplay::Error(text) => {
-            let prefix = if matches!(display, AgentDisplay::Error(_)) {
-                format!("{label} error:")
-            } else {
-                label
-            };
-            if matches!(model, "claude" | "fable" | "opus" | "sonnet" | "haiku") {
-                let budget = terminal::columns().saturating_sub(prefix.chars().count() + 1);
-                format!("{prefix} {}", one_line(text, budget))
-            } else {
-                format!("{prefix} {text}")
-            }
+        AgentDisplay::FullAnswer(text) | AgentDisplay::Answer(text) => {
+            format!("{label} {text}")
         }
+        AgentDisplay::Error(text) => format!("{label} error: {text}"),
     }
 }
 
 fn output_color() -> bool {
     (unsafe { libc::isatty(1) == 1 })
-        && !std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
         && std::env::var("TERM").ok().as_deref() != Some("dumb")
 }
 
@@ -237,16 +226,26 @@ fn main() {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
     }
     let interactive = unsafe { libc::isatty(0) == 1 };
+    let output_is_terminal = unsafe { libc::isatty(1) == 1 };
     let mut terminal = terminal::Terminal::new();
     let mut workers = Workers::new(interactive);
     if interactive {
-        if unsafe { libc::isatty(1) == 1 } {
+        if output_is_terminal {
             if let Err(error) = terminal::clear_screen() {
                 eprintln!("euka: terminal: {error}");
                 std::process::exit(1);
             }
         }
         loop {
+            if output_is_terminal {
+                let home = std::env::var_os("HOME");
+                let title = shortened_path(&session.cwd, home.as_deref().map(Path::new));
+                if let Err(error) = terminal::set_title(&title) {
+                    eprintln!("euka: terminal title: {error}");
+                    session.last_status = 1;
+                    break;
+                }
+            }
             let color = output_color();
             let short_prompt = prompt(session.mode, &session.cwd, false, color);
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
@@ -634,15 +633,14 @@ fn run_agent(
     cwd: &Path,
     context: &str,
     references: &str,
-    answer_chars: usize,
     access: AgentAccess,
     user: AgentUser,
 ) -> Result<String, String> {
     match model {
         "fm" => fm::run(task, cwd, context, references, access),
-        "claude" => claude::run(task, cwd, context, answer_chars, None, access, user),
+        "claude" => claude::run(task, cwd, context, None, access, user),
         "fable" | "opus" | "sonnet" | "haiku" => {
-            claude::run(task, cwd, context, answer_chars, Some(model), access, user)
+            claude::run(task, cwd, context, Some(model), access, user)
         }
         "codex" => codex::run(task, cwd, context, None, access, user),
         "sol" => codex::run(task, cwd, context, Some("gpt-6-sol"), access, user),
@@ -682,16 +680,12 @@ fn resolve_inline(
                 });
                 println!("{}", render_agent(model, id, AgentDisplay::Working));
                 let _ = io::stdout().flush();
-                let answer_chars = terminal::columns()
-                    .saturating_sub(format!("{model}#{id}: ").chars().count() + 1)
-                    .max(1);
                 let answer = run_agent(
                     model,
                     task,
                     &session.cwd,
                     &context,
                     &references.text,
-                    answer_chars,
                     AgentAccess::ReadOnly,
                     AgentUser::Current,
                 )
@@ -751,15 +745,11 @@ fn start_agents(
             access,
             model: Some(model.to_owned()),
         });
-        let answer_chars = terminal::columns()
-            .saturating_sub(format!("{model}#{id}: ").chars().count() + 1)
-            .max(1);
         let request = QueuedAgent {
             id,
             model: model.to_owned(),
             task: task.to_owned(),
             cwd: session.cwd.clone(),
-            answer_chars,
             access,
             user,
         };
@@ -799,7 +789,6 @@ fn launch_agent(
         model,
         task,
         cwd,
-        answer_chars,
         access,
         user,
     } = request;
@@ -809,16 +798,7 @@ fn launch_agent(
         .insert(id, render_agent(&model, id, AgentDisplay::Working));
     let tx = workers.worker_tx.clone();
     std::thread::spawn(move || {
-        let result = run_agent(
-            &model,
-            &task,
-            &cwd,
-            &context,
-            &references,
-            answer_chars,
-            access,
-            user,
-        );
+        let result = run_agent(&model, &task, &cwd, &context, &references, access, user);
         let _ = tx.send(WorkerUpdate::Agent(AgentUpdate {
             id,
             model,
@@ -943,16 +923,11 @@ fn start_live(target: LiveTarget, session: &mut Session, workers: &mut Workers) 
     std::thread::spawn(move || {
         let client = http::agent();
         let started_at = Instant::now();
-        if tx
-            .send(LiveUpdate {
-                id,
-                started_at,
-                result: run_live_target(&target, &cwd, &client),
-            })
-            .is_err()
-        {
-            return;
-        }
+        let _ = tx.send(LiveUpdate {
+            id,
+            started_at,
+            result: run_live_target(&target, &cwd, &client),
+        });
     });
     session.last_status = 0;
 }
@@ -1655,32 +1630,13 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
     }
 }
 
-fn one_line(text: &str, max_chars: usize) -> String {
-    let collapsed = text
-        .chars()
-        .filter(|character| !character.is_control() || character.is_whitespace())
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if collapsed.chars().count() <= max_chars {
-        return collapsed;
-    }
-    if max_chars == 0 {
-        return String::new();
-    }
-    let mut summary = collapsed.chars().take(max_chars - 1).collect::<String>();
-    summary.push('…');
-    summary
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         agent_context, agent_response, agent_response_by_id, diff_lines, format_update,
-        highlight_answer, one_line, prompt, ready_references, render_agent, reset_state,
-        resolve_references, session_context, shortened_path, start_agents, AgentDisplay,
-        AgentUpdate, ReferenceResolution, Workers,
+        highlight_answer, prompt, ready_references, render_agent, reset_state, resolve_references,
+        session_context, shortened_path, start_agents, AgentDisplay, AgentUpdate,
+        ReferenceResolution, Workers,
     };
     use crate::agent_cli::AgentUser;
     use crate::session::{AgentAccess, DiffMode, Event, PromptMode, Session};
@@ -1994,12 +1950,16 @@ mod tests {
     }
 
     #[test]
-    fn claude_answers_fit_one_line() {
+    fn read_only_answers_are_not_clipped_or_reshaped() {
+        let long = "abcdefghijk".repeat(20);
         assert_eq!(
-            one_line(" first\n second\tthird ", 30),
-            "first second third"
+            render_agent("claude", 1, AgentDisplay::Answer(&long)),
+            format!("claude#1: {long}")
         );
-        assert_eq!(one_line("abcdefghijk", 6), "abcde…");
+        assert_eq!(
+            render_agent("sol", 2, AgentDisplay::Answer("first\nsecond")),
+            "sol#2: first\nsecond"
+        );
     }
 
     #[test]
