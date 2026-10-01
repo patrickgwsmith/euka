@@ -1,6 +1,7 @@
 use crate::agent_cli::{self, AgentUser};
 use crate::session::AgentAccess;
 use std::path::Path;
+use std::process::Command;
 
 pub fn run(
     task: &str,
@@ -31,6 +32,25 @@ pub fn run(
     args.push("-");
     let request = request_for_access(task, access);
     agent_cli::run("codex", &args, &request, cwd, context, user, access)
+}
+
+/// The interactive Codex CLI in the same sandbox as `codex?` or `codex!`.
+pub fn interactive(
+    cwd: &Path,
+    model: Option<&str>,
+    access: AgentAccess,
+) -> Result<Command, String> {
+    let mut command = agent_cli::workspace_command("codex", AgentUser::Current, access)?;
+    let sandbox = match access {
+        AgentAccess::ReadOnly => "read-only",
+        AgentAccess::ReadWrite => "workspace-write",
+    };
+    command.args(["--sandbox", sandbox, "--ask-for-approval", "never"]);
+    if let Some(model) = model {
+        command.args(["--model", model]);
+    }
+    command.current_dir(cwd);
+    Ok(command)
 }
 
 fn request_for_access(task: &str, access: AgentAccess) -> String {

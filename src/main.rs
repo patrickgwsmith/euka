@@ -5,6 +5,7 @@ mod feed;
 mod fm;
 mod http;
 mod inline;
+mod jsc;
 mod live;
 mod pi;
 mod session;
@@ -61,8 +62,12 @@ enum AgentDisplay<'a> {
     Error(&'a str),
 }
 
-fn render_agent(model: &str, id: usize, display: AgentDisplay<'_>) -> String {
-    let label = format!("{model}#{id}:");
+fn agent_label(model: &str, access: AgentAccess, id: usize) -> String {
+    format!("{model}{}#{id}", access.suffix())
+}
+
+fn render_agent(model: &str, access: AgentAccess, id: usize, display: AgentDisplay<'_>) -> String {
+    let label = format!("{}:", agent_label(model, access, id));
     match display {
         AgentDisplay::Working => format!("{label} …"),
         AgentDisplay::FullAnswer(text) | AgentDisplay::Answer(text) => {
@@ -78,12 +83,17 @@ fn output_color() -> bool {
         && std::env::var("TERM").ok().as_deref() != Some("dumb")
 }
 
-fn render_agent_output(model: &str, id: usize, display: AgentDisplay<'_>) -> String {
-    let plain = render_agent(model, id, display);
+fn render_agent_output(
+    model: &str,
+    access: AgentAccess,
+    id: usize,
+    display: AgentDisplay<'_>,
+) -> String {
+    let plain = render_agent(model, access, id, display);
     if !output_color() || matches!(display, AgentDisplay::Working) {
         return plain;
     }
-    let label = format!("{model}#{id}:");
+    let label = format!("{}:", agent_label(model, access, id));
     if let Some(body) = plain.strip_prefix(&format!("{label} error: ")) {
         return format!("\x1b[1;31m{label} error:\x1b[0m {body}");
     }
@@ -428,7 +438,10 @@ fn handle(
     let input = if session.mode == PromptMode::FmReadOnly
         && !matches!(
             &classified,
-            Input::AgentReference { .. } | Input::AgentNumberReference { .. }
+            Input::AgentReference { .. }
+                | Input::AgentNumberReference { .. }
+                | Input::LatestAgentResponse
+                | Input::ShowTodos
         ) {
         Input::Agent {
             task: line.trim(),
@@ -493,19 +506,52 @@ fn handle(
             });
         }
         Input::Comment(comment) => session.events.push(Event::Comment(comment.into())),
-        Input::AgentReference { model, id } => match agent_response(session, model, id, workers) {
-            Ok(text) => {
+        Input::LatestAgentResponse => match latest_agent_response(session) {
+            Some((id, model, access, text)) => {
                 println!(
                     "{}",
-                    render_agent_output(model, id, AgentDisplay::FullAnswer(text))
+                    render_agent_output(model, access, id, AgentDisplay::FullAnswer(text))
                 );
                 session.last_status = 0;
             }
-            Err(error) => {
-                eprintln!("euka: {error}");
+            None => {
+                eprintln!("euka: no agent reply yet");
                 session.last_status = 1;
             }
         },
+        Input::AgentReference { model, access, id } => {
+            let result = if let Some(expected_access) = access {
+                if agent_request_by_id(session, id) != Some((model, expected_access)) {
+                    Err(format!(
+                        "no reply found for {}",
+                        agent_label(model, expected_access, id)
+                    ))
+                } else {
+                    agent_response(session, model, id, workers)
+                }
+            } else {
+                agent_response(session, model, id, workers)
+            };
+            match result {
+                Ok(text) => {
+                    let actual_access = agent_access_by_id(session, id).unwrap();
+                    println!(
+                        "{}",
+                        render_agent_output(
+                            model,
+                            actual_access,
+                            id,
+                            AgentDisplay::FullAnswer(text)
+                        )
+                    );
+                    session.last_status = 0;
+                }
+                Err(error) => {
+                    eprintln!("euka: {error}");
+                    session.last_status = 1;
+                }
+            }
+        }
         Input::AgentNumberReference { id } if agent_model_by_id(session, id).is_none() => {
             match watch_response_by_id(session, id, None)
                 .or_else(|| http_response_by_id(session, id))
@@ -543,10 +589,10 @@ fn handle(
             }
         }
         Input::AgentNumberReference { id } => match agent_response_by_id(session, id, workers) {
-            Ok((model, text)) => {
+            Ok((model, access, text)) => {
                 println!(
                     "{}",
-                    render_agent_output(model, id, AgentDisplay::FullAnswer(text))
+                    render_agent_output(model, access, id, AgentDisplay::FullAnswer(text))
                 );
                 session.last_status = 0;
             }
@@ -555,6 +601,16 @@ fn handle(
                 session.last_status = 1;
             }
         },
+        Input::ShowTodos => {
+            if session.todos.is_empty() {
+                println!("no todos");
+            } else {
+                for todo in &session.todos {
+                    println!("- [ ] {todo}");
+                }
+            }
+            session.last_status = 0;
+        }
         Input::Todo(todo) => {
             session.todos.push(todo.into());
             println!("todo {}: {}", session.todos.len(), todo);
@@ -618,6 +674,25 @@ fn handle(
             eprintln!("euka: target '{name}{}' is not available", access.suffix());
             session.last_status = 1;
         }
+        Input::InteractiveAgent { model, access } => {
+            println!(
+                "[{model} interactive {} session; exit it to return to euka]",
+                access.description()
+            );
+            let _ = io::stdout().flush();
+            let status = match interactive_agent(model, &session.cwd, access) {
+                Ok(command) => agent_cli::run_interactive(command, model),
+                Err(error) => {
+                    eprintln!("euka: {error}");
+                    1
+                }
+            };
+            session.last_status = status;
+            session.events.push(Event::Command {
+                input: format!("{model}{}", access.suffix()),
+                status,
+            });
+        }
         Input::Reserved(input) => {
             eprintln!("euka: reserved syntax is not available yet: {input}");
             session.last_status = 1;
@@ -647,6 +722,21 @@ fn run_agent(
         "luna" => codex::run(task, cwd, context, Some("gpt-6-luna"), access, user),
         "terra" => codex::run(task, cwd, context, Some("gpt-5.6-terra"), access, user),
         "pi" => pi::run(task, cwd, context, access, user),
+        "jsc" => jsc::run(task, cwd, access, user),
+        _ => unreachable!(),
+    }
+}
+
+fn interactive_agent(model: &str, cwd: &Path, access: AgentAccess) -> Result<Command, String> {
+    match model {
+        "claude" => claude::interactive(cwd, None, access),
+        "fable" | "opus" | "sonnet" | "haiku" => claude::interactive(cwd, Some(model), access),
+        "codex" => codex::interactive(cwd, None, access),
+        "sol" => codex::interactive(cwd, Some("gpt-6-sol"), access),
+        "luna" => codex::interactive(cwd, Some("gpt-6-luna"), access),
+        "terra" => codex::interactive(cwd, Some("gpt-5.6-terra"), access),
+        "pi" => pi::interactive(cwd, access),
+        "jsc" => jsc::interactive(cwd, access),
         _ => unreachable!(),
     }
 }
@@ -669,7 +759,8 @@ fn resolve_inline(
                 let mut context =
                     session_context_filtered(session, &references.ids, None, &session.cwd);
                 context.push_str(&format!(
-                    "request ({model}#{id}, read-only, current user): {task}\n"
+                    "request ({}, read-only, current user): {task}\n",
+                    agent_label(model, AgentAccess::ReadOnly, id)
                 ));
                 context.push_str(&references.text);
                 session.events.push(Event::AgentRequest {
@@ -678,7 +769,10 @@ fn resolve_inline(
                     access: AgentAccess::ReadOnly,
                     model: Some(model.to_owned()),
                 });
-                println!("{}", render_agent(model, id, AgentDisplay::Working));
+                println!(
+                    "{}",
+                    render_agent(model, AgentAccess::ReadOnly, id, AgentDisplay::Working)
+                );
                 let _ = io::stdout().flush();
                 let answer = run_agent(
                     model,
@@ -689,7 +783,9 @@ fn resolve_inline(
                     AgentAccess::ReadOnly,
                     AgentUser::Current,
                 )
-                .map_err(|error| format!("{model}#{id}: {error}"))?;
+                .map_err(|error| {
+                    format!("{}: {error}", agent_label(model, AgentAccess::ReadOnly, id))
+                })?;
                 let quoted = inline::quote_argument(&answer)?;
                 session.events.push(Event::AgentResponse {
                     id,
@@ -698,7 +794,12 @@ fn resolve_inline(
                 });
                 println!(
                     "{}",
-                    render_agent_output(model, id, AgentDisplay::Answer(&answer))
+                    render_agent_output(
+                        model,
+                        AgentAccess::ReadOnly,
+                        id,
+                        AgentDisplay::Answer(&answer)
+                    )
                 );
                 resolved.push_str(&quoted);
             }
@@ -756,7 +857,7 @@ fn start_agents(
         let status = match &references {
             ReferenceResolution::Ready(references) => {
                 launch_agent(request, references.clone(), session, workers);
-                render_agent(model, id, AgentDisplay::Working)
+                render_agent(model, access, id, AgentDisplay::Working)
             }
             ReferenceResolution::Pending(ids) => {
                 let waiting_for = ids
@@ -764,7 +865,10 @@ fn start_agents(
                     .map(|id| format!("#{id}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let status = format!("{model}#{id}: waiting for {waiting_for}");
+                let status = format!(
+                    "{}: waiting for {waiting_for}",
+                    agent_label(model, access, id)
+                );
                 workers.pending_agents.insert(id, status.clone());
                 workers.queued_agents.insert(id, request);
                 status
@@ -795,7 +899,7 @@ fn launch_agent(
     let references = references.text;
     workers
         .pending_agents
-        .insert(id, render_agent(&model, id, AgentDisplay::Working));
+        .insert(id, render_agent(&model, access, id, AgentDisplay::Working));
     let tx = workers.worker_tx.clone();
     std::thread::spawn(move || {
         let result = run_agent(&model, &task, &cwd, &context, &references, access, user);
@@ -820,9 +924,8 @@ fn agent_context(
         AgentUser::Staffer => "staffer",
     };
     context.push_str(&format!(
-        "request ({}#{}, {}, {username}): {}\n",
-        request.model,
-        request.id,
+        "request ({}, {}, {username}): {}\n",
+        agent_label(&request.model, request.access, request.id),
         request.access.description(),
         request.task
     ));
@@ -943,9 +1046,9 @@ fn run_live_target(
         LiveTarget::Feed { url, selection } => {
             let resource = http::load(client, url)?;
             if *selection == FeedSelection::ContentType
-                && !feed::is_atom_content_type(&resource.content_type)
+                && !feed::is_feed_content_type(&resource.content_type)
             {
-                return Err(format!("URL is not an Atom feed (Content-Type: {}); use + FEED URL to parse an XML feed explicitly", resource.content_type));
+                return Err(format!("URL is not an Atom or RSS feed (Content-Type: {}); use + FEED URL to parse an XML feed explicitly", resource.content_type));
             }
             feed::render(&resource)
         }
@@ -1092,52 +1195,60 @@ fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Worker
 }
 
 fn print_help() {
-    println!("Euka runs ordinary commands directly as a shell. Enter ? for this help.");
-    println!("Shell:");
-    println!("  git status, cargo test, vim file   Run directly in the foreground");
-    println!("  cd, export, unset, exit; NAME=value are built-ins");
-    println!("  reset                Clear session, history, watches, and request IDs");
-    println!("  bash! command       Run a command through Bash as your user");
-    println!("  zsh! command        Run a command through Zsh as your user");
-    println!("  bash? command       Run Bash as staffer (asks for sudo authorization)");
-    println!("  zsh? command        Run Zsh as staffer (asks for sudo authorization)");
-    println!("Live values:");
-    println!("  + bash? command     Run and refresh a Bash command as staffer");
-    println!("  + zsh? command      Run and refresh a Zsh command as staffer");
-    println!("  + HEAD https://...  Check headers now and again when you enter +");
-    println!("  + FEED https://...  Watch an Atom feed; refresh when you enter +");
-    println!("  + https://...       Watch an Atom URL if its Content-Type identifies a feed");
-    println!("  +                   Show added lines from all live values");
-    println!("  +-                  Show added and removed lines from all live values");
-    println!("  #3, #3.2            Show the latest watch result or revision 2 of watch #3");
-    println!("Shared context:");
-    println!("  https://...          Load a text resource into session context (background)");
-    println!("  HEAD https://...     Show response headers and time to receive them");
-    println!("  # comment           Keep context for later agent requests");
-    println!("  - [ ] todo          Add a session todo");
-    println!("Agent:");
-    println!("  claude? task        Ask Claude Code to inspect the project (background)");
-    println!("  fable? task         Ask Claude Code with Fable (background)");
-    println!("  opus? task          Ask Claude Code with Opus (background)");
-    println!("  sonnet? task        Ask Claude Code with Sonnet (background)");
-    println!("  haiku? task         Ask Claude Code with Haiku (background)");
-    println!("  codex? task         Ask Codex to inspect the project (background)");
-    println!("  sol? task           Ask GPT-6 Sol through Codex (background)");
-    println!("  luna? task          Ask GPT-6 Luna through Codex (background)");
-    println!("  terra? task         Ask GPT-5.6 Terra through Codex (background)");
-    println!("  pi? task            Ask Pi to inspect the project (background)");
-    println!("  fm? task            Ask Apple Foundation Models to investigate (background)");
-    println!("  fm! task            Ask Apple Foundation Models to change files (background)");
-    println!("  name! task          Ask a named agent to change files as your user");
-    println!("  opus/luna? task     Ask both agents the same task (background)");
-    println!("  @staffer opus? task Ask a CLI agent as staffer (requires sudo access)");
-    println!("  fm?                 Enter fm read-only mode; ., exit, or Ctrl-C returns");
-    println!("  git commit -m luna?(Suggest a message)  Use one agent reply as an argument");
-    println!("  echo $(date)        Run shell command substitution via Bash or Zsh");
-    println!("  #3, codex#3         Show a numbered result or full agent reply");
-    println!("  claude? agree? #3   Include a numbered result; queue if an agent is still working");
-    println!("  ? task, ! task, and other + forms are not available yet");
-    println!("  Unknown name? or name! targets report an Euka error");
+    let color = output_color();
+    for line in [
+        "Euka runs ordinary commands directly as a shell. Enter ? for this help.",
+        "Shell:",
+        "  Output is shown to you, not shared with agents.",
+        "  Agents see command input and exit status.",
+        "  git status, cargo test, vim file   Run directly in the foreground",
+        "  cd, export, unset, exit; NAME=value are built-ins",
+        "  reset                Clear session, history, watches, and request IDs",
+        "  bash! command       Run a command through Bash as your user",
+        "  zsh! command        Run a command through Zsh as your user",
+        "  bash? command       Run Bash as staffer via sudo",
+        "  zsh? command        Run Zsh as staffer via sudo",
+        "Watch:",
+        "  Agents see watch results; enter + or +- to refresh.",
+        "  + bash? command     Run and refresh a Bash command as staffer",
+        "  + zsh? command      Run and refresh a Zsh command as staffer",
+        "  + HEAD https://...  Check headers now and again when you enter +",
+        "  + FEED https://...  Watch an Atom or RSS feed; refresh when you enter +",
+        "  + https://...       Watch an Atom/RSS URL with a feed Content-Type",
+        "  +                   Show added lines from all watches",
+        "  +-                  Show added and removed lines from all watches",
+        "  #3, #3.2            Show the latest watch result or revision 2 of watch #3",
+        "Shared context:",
+        "  https://...          Load a text resource into session context (background)",
+        "  HEAD https://...     Show response headers and time to receive them",
+        "  # comment           Keep context for later agent requests",
+        "  -                   Show the session todo list",
+        "  - [ ] todo          Add a session todo",
+        "Agent:",
+        "  claude? task        Ask Claude Code to inspect the project (background)",
+        "  fable? task         Ask Claude Code with Fable (background)",
+        "  opus? task          Ask Claude Code with Opus (background)",
+        "  sonnet? task        Ask Claude Code with Sonnet (background)",
+        "  haiku? task         Ask Claude Code with Haiku (background)",
+        "  codex? task         Ask Codex to inspect the project (background)",
+        "  sol? task           Ask GPT-6 Sol through Codex (background)",
+        "  luna? task          Ask GPT-6 Luna through Codex (background)",
+        "  terra? task         Ask GPT-5.6 Terra through Codex (background)",
+        "  pi? task            Ask Pi to inspect the project (background)",
+        "  fm? task            Ask Apple Foundation Models to investigate (background)",
+        "  fm! task            Ask Apple Foundation Models to change files (background)",
+        "  name! task          Ask a named agent to change files as your user",
+        "  opus/luna? task     Ask both agents the same task (background)",
+        "  @staffer opus? task Ask a CLI agent as staffer (requires sudo access)",
+        "  fm?                 Enter fm read-only mode; ., exit, or Ctrl-C returns",
+        "  git commit -m luna?(Suggest a message)  Use one agent reply as an argument",
+        "  echo $(date)        Run shell command substitution via Bash or Zsh",
+        "  #3, codex?#3        Show a numbered result or full agent reply",
+        "  #                   Show the latest completed agent reply",
+        "  claude? agree? #3   Include a numbered result; queue if an agent is still working",
+    ] {
+        println!("{}", terminal::styled_input(line, color));
+    }
     #[cfg(target_os = "macos")]
     {
         println!();
@@ -1225,12 +1336,15 @@ fn session_context_filtered(
                 access,
                 model,
             } => context.push_str(&format!(
-                "request ({}#{id}, {}): {input}\n",
-                model.as_deref().unwrap_or("default"),
+                "request ({}, {}): {input}\n",
+                agent_label(model.as_deref().unwrap_or("default"), *access, *id),
                 access.description()
             )),
             Event::AgentResponse { id, model, text } => {
-                context.push_str(&format!("response ({model}#{id}): {text}\n"))
+                let label = agent_access_by_id(session, *id)
+                    .map(|access| agent_label(model, access, *id))
+                    .unwrap_or_else(|| format!("{model}#{id}"));
+                context.push_str(&format!("response ({label}): {text}\n"))
             }
             Event::Resource { resource, .. } => {
                 context.push_str(&format!(
@@ -1270,7 +1384,9 @@ fn agent_response<'a>(
     }) {
         return Ok(text);
     }
-    let reference = format!("{model}#{id}");
+    let reference = agent_access_by_id(session, id)
+        .map(|access| agent_label(model, access, id))
+        .unwrap_or_else(|| format!("{model}#{id}"));
     let requested = session.events.iter().any(|event| {
         matches!(event,
             Event::AgentRequest { id: request_id, model: Some(request_model), .. }
@@ -1290,22 +1406,42 @@ fn agent_response_by_id<'a>(
     session: &'a Session,
     id: usize,
     workers: &Workers,
-) -> Result<(&'a str, &'a str), String> {
+) -> Result<(&'a str, AgentAccess, &'a str), String> {
     let model =
         agent_model_by_id(session, id).ok_or_else(|| format!("no reply found for #{id}"))?;
     let text = agent_response(session, model, id, workers)?;
-    Ok((model, text))
+    Ok((model, agent_access_by_id(session, id).unwrap(), text))
 }
 
-fn agent_model_by_id(session: &Session, id: usize) -> Option<&str> {
+fn latest_agent_response(session: &Session) -> Option<(usize, &str, AgentAccess, &str)> {
+    session.events.iter().rev().find_map(|event| {
+        if let Event::AgentResponse { id, model, text } = event {
+            agent_access_by_id(session, *id)
+                .map(|access| (*id, model.as_str(), access, text.as_str()))
+        } else {
+            None
+        }
+    })
+}
+
+fn agent_request_by_id(session: &Session, id: usize) -> Option<(&str, AgentAccess)> {
     session.events.iter().find_map(|event| match event {
         Event::AgentRequest {
             id: request_id,
             model: Some(model),
+            access,
             ..
-        } if *request_id == id => Some(model.as_str()),
+        } if *request_id == id => Some((model.as_str(), *access)),
         _ => None,
     })
+}
+
+fn agent_model_by_id(session: &Session, id: usize) -> Option<&str> {
+    agent_request_by_id(session, id).map(|(model, _)| model)
+}
+
+fn agent_access_by_id(session: &Session, id: usize) -> Option<AgentAccess> {
+    agent_request_by_id(session, id).map(|(_, access)| access)
 }
 
 fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
@@ -1364,7 +1500,10 @@ fn ready_references(
         ReferenceResolution::Pending(ids) => {
             let id = ids[0];
             if let Some(model) = agent_model_by_id(session, id) {
-                Err(format!("{model}#{id} is still working"))
+                Err(format!(
+                    "{} is still working",
+                    agent_label(model, agent_access_by_id(session, id).unwrap(), id)
+                ))
             } else {
                 Err(format!("watch #{id} is still loading"))
             }
@@ -1386,9 +1525,11 @@ fn resolve_references(
             || character == '#'
             || character == '.'
             || character == '_'
-            || character == '-')
+            || character == '-'
+            || character == '?'
+            || character == '!')
     }) {
-        let token = raw_token.trim_end_matches('.');
+        let token = raw_token.trim_end_matches(['.', '?', '!']);
         let reference = if let Some((id, revision)) = session::watch_revision_reference(token) {
             let watch = session
                 .live_commands
@@ -1406,9 +1547,15 @@ fn resolve_references(
                 return Err(watch_reference_error(watch, Some(revision)));
             }
             None
-        } else if let Some((model, id)) = session::agent_reference(token) {
-            if agent_model_by_id(session, id) != Some(model) {
-                return Err(format!("no reply found for {model}#{id}"));
+        } else if let Some((model, access, id)) = session::agent_reference(token) {
+            let actual = agent_request_by_id(session, id);
+            if actual.is_none_or(|(actual_model, actual_access)| {
+                actual_model != model || access.is_some_and(|access| access != actual_access)
+            }) {
+                let label = access
+                    .map(|access| agent_label(model, access, id))
+                    .unwrap_or_else(|| format!("{model}#{id}"));
+                return Err(format!("no reply found for {label}"));
             }
             Some((model, id))
         } else if let Some(id) = session::agent_number_reference(token) {
@@ -1442,7 +1589,9 @@ fn resolve_references(
             if seen.insert(id) {
                 match agent_response(session, model, id, workers) {
                     Ok(text) => {
-                        context.push_str(&format!("\nReferenced reply {model}#{id}:\n{text}\n"));
+                        let label =
+                            agent_label(model, agent_access_by_id(session, id).unwrap(), id);
+                        context.push_str(&format!("\nReferenced reply {label}:\n{text}\n"));
                     }
                     Err(_) if workers.pending_agents.contains_key(&id) => {
                         pending.insert(id);
@@ -1587,9 +1736,14 @@ fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Worke
                 AgentAccess::ReadOnly => AgentDisplay::Answer(&text),
                 AgentAccess::ReadWrite => AgentDisplay::FullAnswer(&text),
             };
-            render_agent_output(&model, update.id, display)
+            render_agent_output(&model, update.access, update.id, display)
         }
-        Err(error) => render_agent_output(&model, update.id, AgentDisplay::Error(&error)),
+        Err(error) => render_agent_output(
+            &model,
+            update.access,
+            update.id,
+            AgentDisplay::Error(&error),
+        ),
     };
     resume_queued_agents(session, workers);
     line
@@ -1613,9 +1767,13 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
                     .map(|id| format!("#{id}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                workers
-                    .pending_agents
-                    .insert(id, format!("{}#{id}: waiting for {status}", request.model));
+                workers.pending_agents.insert(
+                    id,
+                    format!(
+                        "{}: waiting for {status}",
+                        agent_label(&request.model, request.access, id)
+                    ),
+                );
             }
             Err(error) => {
                 let request = workers.queued_agents.remove(&id).unwrap();
@@ -1634,9 +1792,9 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
 mod tests {
     use super::{
         agent_context, agent_response, agent_response_by_id, diff_lines, format_update,
-        highlight_answer, prompt, ready_references, render_agent, reset_state, resolve_references,
-        session_context, shortened_path, start_agents, AgentDisplay, AgentUpdate,
-        ReferenceResolution, Workers,
+        highlight_answer, latest_agent_response, prompt, ready_references, render_agent,
+        reset_state, resolve_references, session_context, shortened_path, start_agents,
+        AgentDisplay, AgentUpdate, ReferenceResolution, Workers,
     };
     use crate::agent_cli::AgentUser;
     use crate::session::{AgentAccess, DiffMode, Event, PromptMode, Session};
@@ -1719,20 +1877,35 @@ mod tests {
     fn every_agent_uses_the_same_reply_label() {
         for model in ["fm", "claude", "codex", "pi"] {
             assert_eq!(
-                render_agent(model, 4, AgentDisplay::Working),
-                format!("{model}#4: …")
+                render_agent(model, AgentAccess::ReadOnly, 4, AgentDisplay::Working),
+                format!("{model}?#4: …")
             );
             assert_eq!(
-                render_agent(model, 4, AgentDisplay::Answer("done")),
-                format!("{model}#4: done")
+                render_agent(
+                    model,
+                    AgentAccess::ReadOnly,
+                    4,
+                    AgentDisplay::Answer("done")
+                ),
+                format!("{model}?#4: done")
             );
             assert_eq!(
-                render_agent(model, 4, AgentDisplay::Error("failed")),
-                format!("{model}#4: error: failed")
+                render_agent(
+                    model,
+                    AgentAccess::ReadWrite,
+                    4,
+                    AgentDisplay::Error("failed")
+                ),
+                format!("{model}!#4: error: failed")
             );
             assert_eq!(
-                render_agent(model, 4, AgentDisplay::FullAnswer("line one\nline two")),
-                format!("{model}#4: line one\nline two")
+                render_agent(
+                    model,
+                    AgentAccess::ReadWrite,
+                    4,
+                    AgentDisplay::FullAnswer("line one\nline two")
+                ),
+                format!("{model}!#4: line one\nline two")
             );
         }
     }
@@ -1757,26 +1930,87 @@ mod tests {
         }
         assert!(!session_context(&session).contains("multiline finding"));
         assert_eq!(
-            ready_references("agree? codex#3, codex#3", &session, &workers)
+            ready_references("agree? codex?#3, codex?#3", &session, &workers)
                 .unwrap()
                 .text,
-            "\nReferenced reply codex#3:\nthe full\nmultiline finding\n"
+            "\nReferenced reply codex?#3:\nthe full\nmultiline finding\n"
         );
         assert_eq!(
-            ready_references("agree? #3, codex#3", &session, &workers)
+            ready_references("agree? #3, codex?#3", &session, &workers)
                 .unwrap()
                 .text,
-            "\nReferenced reply codex#3:\nthe full\nmultiline finding\n"
+            "\nReferenced reply codex?#3:\nthe full\nmultiline finding\n"
+        );
+        session.events.push(Event::AgentRequest {
+            id: 4,
+            input: "edit".into(),
+            access: AgentAccess::ReadWrite,
+            model: Some("opus".into()),
+        });
+        session.events.push(Event::AgentResponse {
+            id: 4,
+            model: "opus".into(),
+            text: "changed the file".into(),
+        });
+        assert_eq!(
+            ready_references("check opus!#4", &session, &workers)
+                .unwrap()
+                .text,
+            "\nReferenced reply opus!#4:\nchanged the file\n"
+        );
+        assert_eq!(
+            ready_references("check opus?#4", &session, &workers).unwrap_err(),
+            "no reply found for opus?#4"
         );
         assert_eq!(
             agent_response_by_id(&session, 3, &workers).unwrap(),
-            ("codex", "the full\nmultiline finding")
+            (
+                "codex",
+                AgentAccess::ReadOnly,
+                "the full\nmultiline finding"
+            )
         );
         assert_eq!(
             agent_response(&session, "codex", 3, &workers).unwrap(),
             "the full\nmultiline finding"
         );
         assert!(agent_response(&session, "claude", 3, &workers).is_err());
+    }
+
+    #[test]
+    fn bare_hash_selects_the_latest_completed_agent_reply() {
+        let mut session = Session::new().unwrap();
+        assert_eq!(latest_agent_response(&session), None);
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "first".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("sol".into()),
+        });
+        session.events.push(Event::AgentRequest {
+            id: 2,
+            input: "second".into(),
+            access: AgentAccess::ReadWrite,
+            model: Some("opus".into()),
+        });
+        session.events.push(Event::AgentResponse {
+            id: 2,
+            model: "opus".into(),
+            text: "second finished first".into(),
+        });
+        assert_eq!(
+            latest_agent_response(&session),
+            Some((2, "opus", AgentAccess::ReadWrite, "second finished first"))
+        );
+        session.events.push(Event::AgentResponse {
+            id: 1,
+            model: "sol".into(),
+            text: "first finished last".into(),
+        });
+        assert_eq!(
+            latest_agent_response(&session),
+            Some((1, "sol", AgentAccess::ReadOnly, "first finished last"))
+        );
     }
 
     #[test]
@@ -1789,14 +2023,14 @@ mod tests {
             access: AgentAccess::ReadOnly,
             model: Some("codex".into()),
         });
-        workers.pending_agents.insert(3, "codex#3: …".into());
+        workers.pending_agents.insert(3, "codex?#3: …".into());
         assert_eq!(
-            ready_references("agree? codex#3", &session, &workers).unwrap_err(),
-            "codex#3 is still working"
+            ready_references("agree? codex?#3", &session, &workers).unwrap_err(),
+            "codex?#3 is still working"
         );
         assert_eq!(
             ready_references("agree? #3", &session, &workers).unwrap_err(),
-            "codex#3 is still working"
+            "codex?#3 is still working"
         );
         assert_eq!(
             agent_response_by_id(&session, 99, &workers).unwrap_err(),
@@ -1814,7 +2048,7 @@ mod tests {
         let mut workers = Workers::new(false);
         workers.next_agent_id = 3;
         workers.active_agents = 1;
-        workers.pending_agents.insert(2, "sol#2: …".into());
+        workers.pending_agents.insert(2, "sol?#2: …".into());
         session.events.push(Event::AgentRequest {
             id: 2,
             input: "inspect".into(),
@@ -1832,7 +2066,7 @@ mod tests {
         );
         assert_eq!(
             workers.pending_agents.get(&3).unwrap(),
-            "luna#3: waiting for #2"
+            "luna?#3: waiting for #2"
         );
         assert!(workers.queued_agents.contains_key(&3));
         assert_eq!(workers.active_agents, 2);
@@ -1850,7 +2084,7 @@ mod tests {
         assert!(!workers.queued_agents.contains_key(&3));
         let update = workers.worker_rx.try_recv().unwrap();
         let line = super::format_worker_update(update, &mut session, &mut workers);
-        assert!(line.contains("referenced reply unavailable: sol#2 has no reply"));
+        assert!(line.contains("referenced reply unavailable: sol?#2 has no reply"));
         assert!(workers.pending_agents.is_empty());
         assert_eq!(workers.active_agents, 0);
     }
@@ -1866,7 +2100,7 @@ mod tests {
                 access: AgentAccess::ReadOnly,
                 model: Some("sol".into()),
             });
-            workers.pending_agents.insert(id, format!("sol#{id}: …"));
+            workers.pending_agents.insert(id, format!("sol?#{id}: …"));
         }
         let task = "compare #1 and #2";
         assert!(matches!(
@@ -1892,8 +2126,8 @@ mod tests {
         assert!(matches!(
             resolve_references(task, &session, &workers).unwrap(),
             ReferenceResolution::Ready(references)
-                if references.text.contains("Referenced reply sol#1:\nfirst")
-                    && references.text.contains("Referenced reply sol#2:\nsecond")
+                if references.text.contains("Referenced reply sol?#1:\nfirst")
+                    && references.text.contains("Referenced reply sol?#2:\nsecond")
         ));
     }
 
@@ -1908,7 +2142,7 @@ mod tests {
             access: AgentAccess::ReadOnly,
             model: Some("sol".into()),
         });
-        workers.pending_agents.insert(2, "sol#2: …".into());
+        workers.pending_agents.insert(2, "sol?#2: …".into());
         start_agents(
             "summarize #2",
             AgentAccess::ReadOnly,
@@ -1937,8 +2171,8 @@ mod tests {
         assert!(context.starts_with(&format!("cwd: {}\n", request_cwd.display())));
         assert!(context.contains("comment: added while waiting"));
         assert_eq!(context.matches("unique reply").count(), 1);
-        assert!(!context.contains("response (sol#2):"));
-        assert_eq!(context.matches("request (luna#3").count(), 1);
+        assert!(!context.contains("response (sol?#2):"));
+        assert_eq!(context.matches("request (luna?#3").count(), 1);
     }
 
     #[test]
@@ -1953,12 +2187,22 @@ mod tests {
     fn read_only_answers_are_not_clipped_or_reshaped() {
         let long = "abcdefghijk".repeat(20);
         assert_eq!(
-            render_agent("claude", 1, AgentDisplay::Answer(&long)),
-            format!("claude#1: {long}")
+            render_agent(
+                "claude",
+                AgentAccess::ReadOnly,
+                1,
+                AgentDisplay::Answer(&long)
+            ),
+            format!("claude?#1: {long}")
         );
         assert_eq!(
-            render_agent("sol", 2, AgentDisplay::Answer("first\nsecond")),
-            "sol#2: first\nsecond"
+            render_agent(
+                "sol",
+                AgentAccess::ReadOnly,
+                2,
+                AgentDisplay::Answer("first\nsecond")
+            ),
+            "sol?#2: first\nsecond"
         );
     }
 

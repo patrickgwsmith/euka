@@ -1,6 +1,7 @@
-use crate::agent_cli::AgentUser;
+use crate::agent_cli::{self, AgentUser};
 use crate::session::AgentAccess;
 use std::path::Path;
+use std::process::Command;
 
 pub fn run(
     task: &str,
@@ -32,4 +33,21 @@ pub fn run(
         user,
         access,
     )
+}
+
+/// The interactive Pi CLI with the same tools as `pi?` or `pi!`.
+pub fn interactive(cwd: &Path, access: AgentAccess) -> Result<Command, String> {
+    let mut command = agent_cli::workspace_command("pi", AgentUser::Current, access)?;
+    command
+        .args([
+            "--no-session",
+            "--no-extensions",
+            "--tools",
+            match access {
+                AgentAccess::ReadOnly => "read,grep,find,ls",
+                AgentAccess::ReadWrite => "read,grep,find,ls,edit,write,bash",
+            },
+        ])
+        .current_dir(cwd);
+    Ok(command)
 }

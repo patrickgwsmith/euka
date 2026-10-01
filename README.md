@@ -13,7 +13,9 @@ A coding agent can usually change all the files in your project. Euka gives you 
   - `!` gives read-write access. The agent can change files and run commands.
 - On macOS, a system sandbox prevents file writes during `?` requests, except to temporary directories and the agent's own state. This protection stays on if the agent's own restrictions fail.
 - You can run agents and shell commands as a separate Unix user, `staffer`. This user has less access than your own account.
-- All agents share one session. An agent can see your notes, your commands, and the answers from other agents.
+- All agents share one session. An agent can see your notes, recent command input (and exit statuses but not output), watched command output, and answers from other agents.
+
+Watch a command with `+ bash? git status`, or watch an Atom or RSS feed with `+ FEED URL`. Euka shares the results with agents; enter `+` to refresh the watches. See [Watch a command or URL](#watch-a-command-or-url) for examples.
 
 Euka does not give full protection. Read [Limits of the protection](#limits-of-the-protection) before you use it.
 
@@ -49,8 +51,15 @@ Euka supports these agent names:
 | `codex`, `sol`, `luna`, `terra` | Codex |
 | `pi` | Pi |
 | `fm` | Apple Foundation Models (macOS only) |
+| `jsc` | JavaScriptCore shell (macOS only) |
 
 Each request runs in the background. You can continue to type commands while the agent works.
+
+You can paste a multiline request, including its `opus?` prefix, into the interactive prompt. Euka keeps the pasted line breaks in one request; press Enter after pasting to send it.
+
+Enter an agent name with no request, for example `opus?` or `codex!`, to open that agent's own interactive CLI in the terminal. With `?` the session is read-only, using the same read-only tools and macOS sandbox as a `?` request. With `!` it can change files, using the same tools and sandbox settings as a `!` request. Bare `jsc?` or `jsc!` opens the jsc REPL, and bare `fm?` or `fm!` enters fm mode. When you exit the agent, you return to the Euka prompt.
+
+`jsc` is not a model: Euka runs the request as JavaScript in the macOS JavaScriptCore shell and replies with what the script prints. Use `print()` for output, for example `jsc? print(6 * 7)`.
 
 ### How Euka applies read-only access
 
@@ -60,7 +69,7 @@ For a `?` request, Euka uses these restrictions:
 - **Claude Code:** Euka uses restricted mode and an explicit list of tools.
 - **Pi:** Euka uses an explicit list of tools.
 - **fm:** Euka controls the tools. The agent can list directories and read files in the current directory. It cannot write files or run commands.
-- **macOS system sandbox:** For Claude Code, Codex, and Pi, a macOS sandbox denies all file writes except to `/dev`, the temporary directories (`/tmp` and `/var/folders`), and the agent user's `~/.claude`, `~/.claude.json*`, `~/.codex`, `~/.pi`, `~/.cache`, and `~/Library/Caches`. This protects your project, its Git index, other repositories, and the rest of your home directory.
+- **macOS system sandbox:** For Claude Code, Codex, Pi, and jsc, a macOS sandbox denies all file writes except to `/dev`, the temporary directories (`/tmp` and `/var/folders`), and the agent user's `~/.claude`, `~/.claude.json*`, `~/.codex`, `~/.pi`, `~/.cache`, and `~/Library/Caches`. This protects your project, its Git index, other repositories, and the rest of your home directory.
 
 For a `!` request, Codex uses its `workspace-write` sandbox. Other agents can write files and run commands.
 
@@ -94,11 +103,11 @@ Each agent runs in the background and gets its own reply label.
 
 ### Read and refer to answers
 
-Each request gets a label, for example `codex#3`. Numbers are unique across all agents.
+Each request gets a label, for example `codex?#3` for read-only access or `opus!#4` for read-write access. Numbers are unique across all agents.
 
-- When the request starts, Euka shows `codex#3: …`.
-- When the answer is ready, Euka shows `codex#3: answer`.
-- To show the full answer, enter `#3` or `codex#3`.
+- When the request starts, Euka shows `codex?#3: …`.
+- When the answer is ready, Euka shows `codex?#3: answer`.
+- To show the latest completed agent reply, enter `#`. To show a specific full answer, enter `#3` or `codex?#3`. Older labels such as `codex#3` also work.
 - Claude and Codex read-only agents are asked for a concise one-line answer. Euka displays their replies without clipping; long lines wrap on screen.
 - To give an answer to a different agent, refer to it in the request. For example: `claude? do you agree with #3?`
 - If a request refers to an unfinished answer, Euka queues it in the background, shows `waiting for #3`, and starts it when the answer arrives. A request with several references waits for all of them. Euka builds the queued request's context after those answers enter the session log and includes each referenced answer once. If a referenced request fails, the queued request reports the failure.
@@ -129,11 +138,19 @@ fm? explain how src/session.rs classifies input
 fm! create a file named note.txt containing hello
 ```
 
-To send many read-only `fm` requests, enter `fm?` with no task. The prompt changes to `fm?>`. Each line that you type is then an `fm?` request. To go back to the shell prompt, enter `.` or `exit`, or press Ctrl-C. Agent requests continue to run after you go back.
+To send many read-only `fm` requests, enter `fm?` or `fm!` with no task. The prompt changes to `fm?>`. Each line that you type is then an `fm?` request. To go back to the shell prompt, enter `.` or `exit`, or press Ctrl-C. Agent requests continue to run after you go back.
 
 Euka examines tool access for each `fm` step. Euka skips repeated tool calls. When the step limit is reached, Euka tells the agent to give a final answer.
 
+For a summary of earlier session results, such as `fm? summarize the ops/s`, Euka sends the shared session context directly to `fm` instead of starting a file search. Refer to a specific reply with `#n` when you want that reply alone summarized.
+
 ## Shell commands
+
+### What agents see from commands
+
+For an ordinary command such as `git status`, Euka shows you the output in the terminal, but gives agents only the command text and exit status. It does not add that command's stdout or stderr to the shared session.
+
+To share a command's output with agents, register a watch such as `+ bash? git status`. Euka includes watch output in agent context. Shell watches run as `staffer`, and you refresh them by entering `+` or `+-`. Agents can also run commands themselves when their access allows it, so this controls what Euka shares automatically rather than what an agent can ever learn.
 
 ### Commands that run as you
 
@@ -172,12 +189,13 @@ Put `+` before `bash?`, `zsh?`, `HEAD`, or `FEED` to watch a command or URL:
 + bash? git status
 + HEAD https://github.com/patrickgwsmith/euka
 + FEED https://github.com/patrickgwsmith/euka/commits/main.atom
++ FEED https://static.crates.io/rss/updates.xml
 + https://github.com/patrickgwsmith/euka/commits/main.atom
 ```
 
 - Euka runs each watch once when registered and again only when you enter `+` or `+-`. Shell watches run as `staffer`; HEAD and feed watches use Euka's HTTP client.
-- `+ URL` accepts an Atom feed when its response has `Content-Type: application/atom+xml`. Use `+ FEED URL` to parse an Atom feed served with a generic XML content type. Feed entries show their title and link; `+` shows new entries and `+-` also shows entries that disappeared from the feed.
-- Agents can see the output in the shared session.
+- `+ URL` accepts Atom and RSS feeds when their responses have `Content-Type: application/atom+xml` or `application/rss+xml`. Use `+ FEED URL` to parse a feed served with a generic XML content type, such as the crates.io RSS feed. Feed entries show their title and link; `+` shows new entries and `+-` also shows entries that disappeared from the feed.
+- Agents can see watch output in the shared session.
 - Shell watches need passwordless `sudo` for `staffer`. Errors show at the prompt.
 - You can watch more than one command or directory at the same time.
 
@@ -187,6 +205,33 @@ Every watch, HTTP request, and agent request uses the same number sequence. A wa
 
 Numbered HTTP results, such as `[head #2]`, can also be referenced in an agent request with `#2`.
 
+### Example: build a Base64 crate
+
+In a fresh Euka session, write down the goal, create the crate, and watch recent crates.io releases. The feed is shared context; the crate's feature plan does not depend on a particular release appearing in it. Ask Opus to research the feature set, Pi to implement it, and Luna to review the code. This transcript shows illustrative, shortened output; enter each request after the preceding reply arrives:
+
+```text
+# I want to make a base64 encoder in Rust
+cargo new --lib mini-base64
+cd mini-base64
++ FEED https://static.crates.io/rss/updates.xml
+[watch #1 loading] + FEED https://static.crates.io/rss/updates.xml
+[watch #1.1 + FEED https://static.crates.io/rss/updates.xml] New crate version published: ...
+opus? Research the features a small Base64 Rust crate should support. Suggest a public API and test cases for standard and URL-safe encoding.
+opus?#2: Support both alphabets, specify padding behavior, and test RFC 4648 vectors plus empty and non-ASCII bytes.
+pi! Implement the API and tests proposed in #2, with documentation for standard and URL-safe encoding.
+pi!#3: Added standard and URL-safe encoders, padding options, documentation, and test vectors.
+luna? Review #3, src/lib.rs, and the tests for correctness and API clarity before publishing.
+luna?#4: The encoders and tests cover the key cases; check the package metadata before publishing.
+```
+
+The first `#` line is a note shared with all agents. The feed is `#1`, Opus's research is `#2`, and Pi's implementation is `#3`. You can send Luna's review request while Pi is still working; referring to `#3` queues it until Pi's result arrives. After you review the code, address Luna's feedback, choose an available crate name, and fill in the crate's metadata, you run the publication commands yourself:
+
+```text
+cargo test
+cargo publish --dry-run
+cargo publish
+```
+
 ### Notes, todos, and URLs
 
 Euka keeps these items in the session, and agents can see them:
@@ -194,6 +239,8 @@ Euka keeps these items in the session, and agents can see them:
 - Comments that start with `#`.
 - Todos that start with `- [ ]`.
 - Web pages. Enter an HTTP or HTTPS URL to load the page in the background. Euka keeps up to 4 MiB of each page in memory. Agents get a part of the page.
+
+Enter `-` alone to show the current TODO list.
 
 Euka does not follow redirects. It shows the new URL. To load that page, enter the new URL.
 
@@ -257,7 +304,10 @@ Tab completion accepts relative paths, absolute paths, and paths that start with
 
 - Euka does not support Bash control syntax, globbing, or persistence. Use `bash!` or `zsh!` for these.
 - History and the session are in memory only. Euka discards them when you exit.
-- Euka does not keep command output in the session. Agents see only command names and exit statuses. Watched commands are an exception.
 - Euka reserves `?` and `!` without an agent name for a future default model.
 - Euka recognizes all `name?` and `name!` forms as agent requests. If the agent is not available, Euka shows an error and does not run a shell command. Names can contain letters, digits, underscores, hyphens, and periods. The `?` or `!` must be at the end of the first word.
 - Euka reserves other syntax for future use.
+
+## TODO
+
+- [ ] Show live status for background Codex requests by reading `codex exec --json` events as they arrive, similar to Claude Code's `stream-json` output. Keep the final answer as the numbered result.

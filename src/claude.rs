@@ -1,6 +1,7 @@
 use crate::agent_cli::{self, AgentUser};
 use crate::session::AgentAccess;
 use std::path::Path;
+use std::process::Command;
 
 const PROMPT: &str = "Answer the Euka user request supplied on stdin. Use the Euka session context and inspect project files as needed.";
 
@@ -56,6 +57,34 @@ pub fn run(
         return Err(format!("claude {}: {}", output.status, stderr.trim()));
     }
     parse_result(&output.stdout)
+}
+
+/// The interactive Claude Code CLI with the same tools as `claude?` or `claude!`.
+pub fn interactive(
+    cwd: &Path,
+    model: Option<&str>,
+    access: AgentAccess,
+) -> Result<Command, String> {
+    let mut command = agent_cli::workspace_command("claude", AgentUser::Current, access)?;
+    let tools = match access {
+        AgentAccess::ReadOnly => "Read,Glob,Grep",
+        AgentAccess::ReadWrite => "Read,Glob,Grep,Edit,Write,Bash",
+    };
+    command.args([
+        "--restricted",
+        "--strict-mcp-config",
+        "--tools",
+        tools,
+        "--allowedTools",
+        tools,
+        "--disallowedTools",
+        "mcp__*",
+    ]);
+    if let Some(model) = model {
+        command.args(["--model", model]);
+    }
+    command.current_dir(cwd);
+    Ok(command)
 }
 
 fn parse_result(output: &[u8]) -> Result<String, String> {

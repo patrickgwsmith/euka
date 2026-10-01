@@ -28,12 +28,19 @@ impl RawMode {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { original })
+        let mode = Self { original };
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"\x1b[?2004h")?;
+        stdout.flush()?;
+        Ok(mode)
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(b"\x1b[?2004l");
+        let _ = stdout.flush();
         unsafe {
             libc::tcsetattr(io::stdin().as_raw_fd(), libc::TCSANOW, &self.original);
         }
@@ -363,6 +370,16 @@ impl Terminal {
                                 let end = next_char(&bytes, cursor);
                                 bytes.drain(cursor..end);
                             }
+                            Some(b'2')
+                                if read_byte_timeout(50)? == Some(b'0')
+                                    && read_byte_timeout(50)? == Some(b'0')
+                                    && read_byte_timeout(50)? == Some(b'~') =>
+                            {
+                                let paste = read_bracketed_paste()?;
+                                let length = paste.len();
+                                bytes.splice(cursor..cursor, paste);
+                                cursor += length;
+                            }
                             _ => {}
                         },
                         _ => {}
@@ -472,6 +489,49 @@ fn read_byte_timeout(timeout_ms: i32) -> io::Result<Option<u8>> {
         ));
     }
     read_byte()
+}
+
+fn read_bracketed_paste() -> io::Result<Vec<u8>> {
+    const END: &[u8] = b"\x1b[201~";
+    let mut bytes = Vec::new();
+    loop {
+        let byte = read_byte()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "bracketed paste was not closed",
+            )
+        })?;
+        bytes.push(byte);
+        if bytes.ends_with(END) {
+            bytes.truncate(bytes.len() - END.len());
+            return Ok(normalize_paste(&bytes));
+        }
+    }
+}
+
+fn normalize_paste(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut after_cr = false;
+    for &byte in bytes {
+        match byte {
+            b'\r' => {
+                normalized.push(b'\n');
+                after_cr = true;
+            }
+            b'\n' if after_cr => after_cr = false,
+            b'\n' => normalized.push(b'\n'),
+            b'\t' => {
+                normalized.extend_from_slice(b"    ");
+                after_cr = false;
+            }
+            32..=126 | 128..=255 => {
+                normalized.push(byte);
+                after_cr = false;
+            }
+            _ => after_cr = false,
+        }
+    }
+    normalized
 }
 
 fn prev_char(bytes: &[u8], mut pos: usize) -> usize {
@@ -671,6 +731,12 @@ fn write_input(mut output: impl Write, line: &str, color: bool) -> io::Result<()
         }
     }
     output.write_all(line.as_bytes())
+}
+
+pub fn styled_input(line: &str, color: bool) -> String {
+    let mut output = Vec::with_capacity(line.len() + 16);
+    write_input(&mut output, line, color).expect("writing to a Vec cannot fail");
+    String::from_utf8(output).expect("ANSI styling preserves UTF-8")
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -943,9 +1009,9 @@ fn common_prefix(strings: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        backward_word, clear_editor, completions_in, forward_word, kill, selector_highlight,
-        write_input, write_notices, write_title, write_wrapped, EditorDisplay, KillDirection,
-        SelectorKind,
+        backward_word, clear_editor, completions_in, forward_word, kill, normalize_paste,
+        selector_highlight, styled_input, write_input, write_notices, write_title, write_wrapped,
+        EditorDisplay, KillDirection, SelectorKind,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -955,6 +1021,14 @@ mod tests {
         let mut output = Vec::new();
         write_title(&mut output, "~/C/project\x1b]0;injected\x07").unwrap();
         assert_eq!(output, b"\x1b]2;~/C/project?]0;injected?\x1b\\");
+    }
+
+    #[test]
+    fn pasted_lines_keep_blank_lines_and_do_not_carry_terminal_controls() {
+        assert_eq!(
+            normalize_paste(b"opus? first\r\n\r\n\tsecond\nthird\x1b[31m"),
+            b"opus? first\n\n    second\nthird[31m"
+        );
     }
 
     #[test]
@@ -1016,6 +1090,23 @@ mod tests {
         let mut plain = Vec::new();
         write_input(&mut plain, "bash! rm file", false).unwrap();
         assert_eq!(plain, b"bash! rm file");
+    }
+
+    #[test]
+    fn help_examples_use_prompt_selector_colors() {
+        assert_eq!(
+            styled_input("  opus? task          Ask Opus", true),
+            "  \x1b[1;35mopus?\x1b[0m task          Ask Opus"
+        );
+        assert_eq!(
+            styled_input("  + bash? command     Watch as staffer", true),
+            "  + \x1b[1;34mbash?\x1b[0m command     Watch as staffer"
+        );
+        assert_eq!(
+            styled_input("  bash! command       Run Bash", true),
+            "  \x1b[1;31mbash!\x1b[0m command       Run Bash"
+        );
+        assert_eq!(styled_input("  opus? task", false), "  opus? task");
     }
 
     #[test]

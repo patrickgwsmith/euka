@@ -48,6 +48,7 @@ enum StepMode {
 enum TaskScope {
     Workspace,
     ReferenceSummary,
+    SessionSummary,
 }
 
 fn task_scope(task: &str, references: &str) -> TaskScope {
@@ -65,15 +66,31 @@ fn task_scope(task: &str, references: &str) -> TaskScope {
             !(character.is_ascii_alphanumeric()
                 || character == '#'
                 || character == '_'
-                || character == '-')
+                || character == '-'
+                || character == '?'
+                || character == '!')
         })
         .any(|token| {
+            let token = token.trim_end_matches(['?', '!']);
             session::agent_number_reference(token).is_some()
                 || session::agent_reference(token).is_some()
         });
     let mentions_files = task.split_whitespace().any(|word| {
         let word = word.to_ascii_lowercase();
-        word.contains('/')
+        let file_extension = word.rsplit_once('.').is_some_and(|(_, extension)| {
+            !extension.is_empty()
+                && extension.len() <= 8
+                && extension.bytes().all(|byte| byte.is_ascii_alphabetic())
+        });
+        (word.contains('/')
+            && (word.starts_with('/')
+                || word.starts_with("./")
+                || word.starts_with("../")
+                || word.starts_with("~/")
+                || word.ends_with('/')
+                || word.contains('.')
+                || word.matches('/').count() > 1))
+            || file_extension
             || matches!(
                 word.as_str(),
                 "file"
@@ -86,10 +103,13 @@ fn task_scope(task: &str, references: &str) -> TaskScope {
                     | "code"
             )
     });
-    if summarizes && references_reply && !references.is_empty() && !mentions_files {
+    if !summarizes || mentions_files {
+        return TaskScope::Workspace;
+    }
+    if references_reply && !references.is_empty() {
         TaskScope::ReferenceSummary
     } else {
-        TaskScope::Workspace
+        TaskScope::SessionSummary
     }
 }
 
@@ -126,8 +146,10 @@ pub fn run(
     references: &str,
     access: AgentAccess,
 ) -> Result<String, String> {
-    if task_scope(task, references) == TaskScope::ReferenceSummary {
-        return respond_text(&reference_prompt(task, references));
+    match task_scope(task, references) {
+        TaskScope::ReferenceSummary => return respond_text(&summary_prompt(task, references)),
+        TaskScope::SessionSummary => return respond_text(&summary_prompt(task, context)),
+        TaskScope::Workspace => {}
     }
     let root = cwd.canonicalize().map_err(|e| format!("workspace: {e}"))?;
     let schema = SchemaFile::new(SCHEMA)?;
@@ -141,8 +163,10 @@ pub fn run(
     })
 }
 
-fn reference_prompt(task: &str, references: &str) -> String {
-    format!("{task}\n\n{references}")
+fn summary_prompt(task: &str, source: &str) -> String {
+    format!(
+        "Answer the request from the supplied Euka session results. Use relevant figures from earlier replies when present. If the requested facts are absent, say so; do not invent them. Keep the answer concise.\n\nRequest: {task}\n\nEuka session results:\n{source}"
+    )
 }
 
 fn run_with(
@@ -374,7 +398,7 @@ pub fn tail(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        list, read, reference_prompt, run_with, task_scope, AgentAccess, StepMode, TaskScope,
+        list, read, run_with, summary_prompt, task_scope, AgentAccess, StepMode, TaskScope,
         MAX_STEPS,
     };
     use serde_json::json;
@@ -447,16 +471,35 @@ mod tests {
 
     #[test]
     fn summarizing_a_reply_uses_direct_prompt() {
-        let references = "Referenced reply luna#3:\nA detailed answer about the project.\n";
+        let references = "Referenced reply luna?#3:\nA detailed answer about the project.\n";
         assert_eq!(
             task_scope("Summarize #3 in 5 words", references),
+            TaskScope::ReferenceSummary
+        );
+        assert_eq!(
+            task_scope("Summarize luna?#3?", references),
             TaskScope::ReferenceSummary
         );
         assert_eq!(
             task_scope("Summarize #3 and inspect src/main.rs", references),
             TaskScope::Workspace
         );
-        assert_eq!(reference_prompt("Summarize #3 in 5 words", references),
-            "Summarize #3 in 5 words\n\nReferenced reply luna#3:\nA detailed answer about the project.\n");
+        assert!(summary_prompt("Summarize #3 in 5 words", references).contains(references));
+    }
+
+    #[test]
+    fn summarizing_session_results_does_not_start_workspace_inspection() {
+        assert_eq!(
+            task_scope("summarize the ops/s", ""),
+            TaskScope::SessionSummary
+        );
+        assert_eq!(
+            task_scope("summarize the ops/s in results.txt", ""),
+            TaskScope::Workspace
+        );
+        let context = "response (luna?#3): Compiled: 120 ops/s; interpreted: 20 ops/s.\n";
+        let prompt = summary_prompt("summarize the ops/s", context);
+        assert!(prompt.contains(context));
+        assert!(prompt.contains("Request: summarize the ops/s"));
     }
 }

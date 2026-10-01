@@ -133,6 +133,7 @@ pub enum Input<'a> {
         reader: bool,
     },
     Comment(&'a str),
+    ShowTodos,
     Todo(&'a str),
     LiveHostShell {
         program: &'static str,
@@ -144,8 +145,10 @@ pub enum Input<'a> {
     Url(&'a str),
     Head(&'a str),
     EnterFm,
+    LatestAgentResponse,
     AgentReference {
         model: &'a str,
+        access: Option<AgentAccess>,
         id: usize,
     },
     AgentNumberReference {
@@ -167,6 +170,10 @@ pub enum Input<'a> {
     AsStaffer(Box<Input<'a>>),
     UnavailableTarget {
         name: &'a str,
+        access: AgentAccess,
+    },
+    InteractiveAgent {
+        model: &'a str,
         access: AgentAccess,
     },
     Reserved(&'a str),
@@ -196,6 +203,8 @@ pub fn classify(line: &str) -> Input<'_> {
         }
     } else if line.trim_end() == "?" {
         Input::Help
+    } else if line.trim_end() == "#" {
+        Input::LatestAgentResponse
     } else if line.trim_end() == "+" {
         Input::LiveDiff(DiffMode::Added)
     } else if line.trim_end() == "+-" {
@@ -218,6 +227,8 @@ pub fn classify(line: &str) -> Input<'_> {
         .filter(|rest| rest.starts_with("https://") || rest.starts_with("http://"))
     {
         Input::LiveFeed(url.trim_end(), FeedSelection::ContentType)
+    } else if line.trim_end() == "-" {
+        Input::ShowTodos
     } else if let Some(rest) = line.strip_prefix("- [ ] ") {
         Input::Todo(rest)
     } else if let Some(command) = line
@@ -238,8 +249,8 @@ pub fn classify(line: &str) -> Input<'_> {
         }
     } else if line.trim_end() == "fm?" {
         Input::EnterFm
-    } else if let Some((model, id)) = agent_reference(line.trim_end()) {
-        Input::AgentReference { model, id }
+    } else if let Some((model, access, id)) = agent_reference(line.trim_end()) {
+        Input::AgentReference { model, access, id }
     } else if let Some((id, revision)) = watch_revision_reference(line.trim_end()) {
         Input::WatchRevisionReference { id, revision }
     } else if let Some(id) = agent_number_reference(line.trim_end()) {
@@ -295,7 +306,19 @@ pub fn classify(line: &str) -> Input<'_> {
     } else if line.starts_with("https://") || line.starts_with("http://") {
         Input::Url(line.trim_end())
     } else if let Some((name, access)) = named_target(line) {
-        Input::UnavailableTarget { name, access }
+        if is_agent_model(name) && line.split_whitespace().nth(1).is_none() {
+            // A bare agent opens interactively: `?` read-only, `!` read-write.
+            if name == "fm" {
+                Input::EnterFm
+            } else {
+                Input::InteractiveAgent {
+                    model: name,
+                    access,
+                }
+            }
+        } else {
+            Input::UnavailableTarget { name, access }
+        }
     } else if line.starts_with('+') || line.starts_with("-?") || line.starts_with('@') {
         Input::Reserved(line)
     } else {
@@ -335,15 +358,22 @@ pub fn is_agent_model(model: &str) -> bool {
             | "luna"
             | "terra"
             | "pi"
-    )
+    ) || (cfg!(target_os = "macos") && model == "jsc")
 }
 
-pub fn agent_reference(token: &str) -> Option<(&str, usize)> {
-    let (model, number) = token.split_once('#')?;
+pub fn agent_reference(token: &str) -> Option<(&str, Option<AgentAccess>, usize)> {
+    let (name, number) = token.split_once('#')?;
+    let (model, access) = if let Some(model) = name.strip_suffix('?') {
+        (model, Some(AgentAccess::ReadOnly))
+    } else if let Some(model) = name.strip_suffix('!') {
+        (model, Some(AgentAccess::ReadWrite))
+    } else {
+        (name, None)
+    };
     if !is_agent_model(model) {
         return None;
     }
-    Some((model, parse_agent_id(number)?))
+    Some((model, access, parse_agent_id(number)?))
 }
 
 pub fn agent_number_reference(token: &str) -> Option<usize> {
@@ -405,15 +435,32 @@ mod tests {
     };
 
     #[test]
+    fn pasted_multiline_agent_task_is_one_request() {
+        assert!(matches!(
+            classify("opus? Explain this:\nfirst line\nsecond line"),
+            Input::Agent {
+                task: "Explain this:\nfirst line\nsecond line",
+                access: AgentAccess::ReadOnly,
+                model: Some("opus"),
+            }
+        ));
+    }
+
+    #[test]
     fn agent_reply_reference_is_explicit_syntax() {
         assert!(matches!(
-            classify("codex#3"),
+            classify("codex?#3"),
             Input::AgentReference {
                 model: "codex",
+                access: Some(AgentAccess::ReadOnly),
                 id: 3
             }
         ));
-        assert_eq!(agent_reference("claude#12"), Some(("claude", 12)));
+        assert_eq!(
+            agent_reference("claude!#12"),
+            Some(("claude", Some(AgentAccess::ReadWrite), 12))
+        );
+        assert_eq!(agent_reference("claude#12"), Some(("claude", None, 12)));
         assert_eq!(agent_reference("codex#0"), None);
         assert_eq!(agent_reference("codex#3x"), None);
         assert_eq!(agent_reference("issue#3"), None);
@@ -421,6 +468,7 @@ mod tests {
             classify("#3"),
             Input::AgentNumberReference { id: 3 }
         ));
+        assert!(matches!(classify("#"), Input::LatestAgentResponse));
         assert_eq!(agent_number_reference("#12"), Some(12));
         assert_eq!(agent_number_reference("#0"), None);
         assert_eq!(agent_number_reference("#3x"), None);
@@ -431,6 +479,16 @@ mod tests {
             Input::WatchRevisionReference { id: 3, revision: 2 }
         ));
         assert!(matches!(classify("# note"), Input::Comment("note")));
+    }
+
+    #[test]
+    fn bare_dash_lists_todos() {
+        assert!(matches!(classify("-"), Input::ShowTodos));
+        assert!(matches!(classify("-   "), Input::ShowTodos));
+        assert!(matches!(
+            classify("- [ ] write docs"),
+            Input::Todo("write docs")
+        ));
     }
 
     #[test]
@@ -477,6 +535,11 @@ mod tests {
                 task: "fix the parser"
             }
         ));
+    }
+
+    #[test]
+    fn jsc_is_an_agent_only_on_macos() {
+        assert_eq!(super::is_agent_model("jsc"), cfg!(target_os = "macos"));
     }
 
     #[test]
@@ -765,6 +828,26 @@ mod tests {
             classify("./foo? task"),
             Input::Shell("./foo? task")
         ));
+    }
+
+    #[test]
+    fn bare_agent_opens_interactively() {
+        assert!(matches!(
+            classify("opus?"),
+            Input::InteractiveAgent {
+                model: "opus",
+                access: AgentAccess::ReadOnly
+            }
+        ));
+        assert!(matches!(
+            classify("  codex!  "),
+            Input::InteractiveAgent {
+                model: "codex",
+                access: AgentAccess::ReadWrite
+            }
+        ));
+        assert!(matches!(classify("fm?"), Input::EnterFm));
+        assert!(matches!(classify("fm!"), Input::EnterFm));
     }
 
     #[test]

@@ -141,6 +141,34 @@ pub fn run_with_input(
     Ok(output)
 }
 
+/// Runs an agent's own interactive CLI in the foreground on the terminal,
+/// inside the read-only sandbox, and returns its exit status.
+pub fn run_interactive(mut command: Command, program: &str) -> i32 {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    // SAFETY: the pre-exec hook only restores default signal dispositions.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    match command.status() {
+        Ok(status) => status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        Err(error) => {
+            eprintln!("euka: {program}: {error}");
+            if error.kind() == ErrorKind::NotFound {
+                127
+            } else {
+                126
+            }
+        }
+    }
+}
+
 pub fn session_input(context: &str, task: &str) -> String {
     format!("Euka session context:\n{context}\nUser request:\n{task}\n")
 }

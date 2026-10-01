@@ -11,11 +11,28 @@ struct Entry {
     link: String,
 }
 
-pub fn is_atom_content_type(content_type: &str) -> bool {
-    content_type
-        .split(';')
-        .next()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/atom+xml"))
+#[derive(Clone, Copy)]
+enum FeedFormat {
+    Atom,
+    Rss,
+}
+
+impl FeedFormat {
+    fn item_path(self) -> &'static [&'static str] {
+        match self {
+            Self::Atom => &["feed", "entry"],
+            Self::Rss => &["rss", "channel", "item"],
+        }
+    }
+}
+
+pub fn is_feed_content_type(content_type: &str) -> bool {
+    content_type.split(';').next().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "application/atom+xml" | "application/rss+xml"
+        )
+    })
 }
 
 fn local_name(name: &str) -> &str {
@@ -27,45 +44,58 @@ pub fn render(resource: &Resource) -> Result<String, String> {
     let mut path = Vec::new();
     let mut entries = Vec::new();
     let mut current: Option<Entry> = None;
-    let mut saw_feed = false;
+    let mut format = None;
+    let mut saw_channel = false;
     loop {
         let event = reader
             .read_event()
-            .map_err(|error| format!("invalid Atom XML: {error}"))?;
+            .map_err(|error| format!("invalid feed XML: {error}"))?;
         let empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(tag) | Event::Empty(tag) => {
                 let name = local_name(tag.name().as_ref()).to_owned();
                 if path.is_empty() {
-                    if name != "feed" {
-                        return Err("XML root is not an Atom feed".into());
-                    }
-                    let namespace_name = tag
-                        .name()
-                        .as_ref()
-                        .split_once(':')
-                        .map(|(prefix, _)| format!("xmlns:{prefix}"))
-                        .unwrap_or_else(|| "xmlns".to_owned());
-                    let mut atom_namespace = false;
-                    for attribute in tag.attributes() {
-                        let attribute = attribute
-                            .map_err(|error| format!("invalid Atom attribute: {error}"))?;
-                        if attribute.key.as_ref() == namespace_name {
-                            atom_namespace = attribute
-                                .normalized_value(XmlVersion::Implicit1_0)
-                                .map_err(|error| format!("invalid Atom attribute: {error}"))?
-                                == "http://www.w3.org/2005/Atom";
+                    format = Some(match name.as_str() {
+                        "feed" => {
+                            let namespace_name = tag
+                                .name()
+                                .as_ref()
+                                .split_once(':')
+                                .map(|(prefix, _)| format!("xmlns:{prefix}"))
+                                .unwrap_or_else(|| "xmlns".to_owned());
+                            let mut atom_namespace = false;
+                            for attribute in tag.attributes() {
+                                let attribute = attribute
+                                    .map_err(|error| format!("invalid Atom attribute: {error}"))?;
+                                if attribute.key.as_ref() == namespace_name {
+                                    atom_namespace = attribute
+                                        .normalized_value(XmlVersion::Implicit1_0)
+                                        .map_err(|error| {
+                                            format!("invalid Atom attribute: {error}")
+                                        })?
+                                        == "http://www.w3.org/2005/Atom";
+                                }
+                            }
+                            if !atom_namespace {
+                                return Err("XML root is not in the Atom namespace".into());
+                            }
+                            FeedFormat::Atom
                         }
-                    }
-                    if !atom_namespace {
-                        return Err("XML root is not in the Atom namespace".into());
-                    }
-                    saw_feed = true;
+                        "rss" => FeedFormat::Rss,
+                        _ => return Err("XML root is not an Atom or RSS feed".into()),
+                    });
                 }
-                if path.len() == 1 && name == "entry" {
+                let format = format.expect("feed root was checked");
+                if matches!(format, FeedFormat::Rss) && path == ["rss"] && name == "channel" {
+                    saw_channel = true;
+                }
+                if path.as_slice() == &format.item_path()[..format.item_path().len() - 1]
+                    && name == format.item_path()[format.item_path().len() - 1]
+                {
                     current = Some(Entry::default());
                 }
-                if path.len() == 2 && path[1] == "entry" && name == "link" {
+                if matches!(format, FeedFormat::Atom) && path == ["feed", "entry"] && name == "link"
+                {
                     let mut href = None;
                     let mut rel = None;
                     for attribute in tag.attributes() {
@@ -93,40 +123,47 @@ pub fn render(resource: &Resource) -> Result<String, String> {
                 }
             }
             Event::End(_) => {
-                if path.len() == 2 && path[1] == "entry" {
+                let format = format.ok_or("XML has no feed root")?;
+                if path.as_slice() == format.item_path() {
                     if let Some(entry) = current.take() {
-                        if entry.id.trim().is_empty() || entry.title.trim().is_empty() {
+                        if matches!(format, FeedFormat::Atom)
+                            && (entry.id.trim().is_empty() || entry.title.trim().is_empty())
+                        {
                             return Err("Atom entry is missing an id or title".into());
                         }
+                        if matches!(format, FeedFormat::Rss) && entry.title.trim().is_empty() {
+                            return Err("RSS item is missing a title".into());
+                        }
                         let title = one_line(&entry.title);
-                        let link = if entry.link.is_empty() {
-                            &entry.id
+                        let link = if !entry.link.trim().is_empty() {
+                            entry.link.trim()
+                        } else if matches!(format, FeedFormat::Atom)
+                            || entry.id.trim().starts_with("https://")
+                            || entry.id.trim().starts_with("http://")
+                        {
+                            entry.id.trim()
                         } else {
-                            &entry.link
+                            ""
                         };
-                        entries.push(format!("{title} — {link}"));
+                        entries.push(if link.is_empty() {
+                            title
+                        } else {
+                            format!("{title} — {link}")
+                        });
                     }
                 }
                 path.pop();
             }
-            Event::Text(text) if path.len() >= 3 && path[1] == "entry" => {
-                if let Some(entry) = &mut current {
-                    match path[2].as_str() {
-                        "id" => entry.id.push_str(&text.xml10_content()),
-                        "title" => entry.title.push_str(&text.xml10_content()),
-                        _ => {}
-                    }
-                }
+            Event::Text(text) => {
+                append_item_text(format, &path, &mut current, &text.xml10_content());
             }
-            Event::CData(text) if path.len() >= 3 && path[1] == "entry" && path[2] == "title" => {
-                if let Some(entry) = &mut current {
-                    entry.title.push_str(&text.xml10_content());
-                }
+            Event::CData(text) => {
+                append_item_text(format, &path, &mut current, &text.xml10_content());
             }
-            Event::GeneralRef(reference) if path.len() >= 3 && path[1] == "entry" => {
+            Event::GeneralRef(reference) if current.is_some() => {
                 let character = reference
                     .resolve_char_ref()
-                    .map_err(|error| format!("invalid Atom entity: {error}"))?
+                    .map_err(|error| format!("invalid feed entity: {error}"))?
                     .or_else(|| match reference.as_ref() {
                         "amp" => Some('&'),
                         "lt" => Some('<'),
@@ -135,23 +172,45 @@ pub fn render(resource: &Resource) -> Result<String, String> {
                         "apos" => Some('\''),
                         _ => None,
                     })
-                    .ok_or("unsupported Atom entity")?;
-                if let Some(entry) = &mut current {
-                    match path[2].as_str() {
-                        "id" => entry.id.push(character),
-                        "title" => entry.title.push(character),
-                        _ => {}
-                    }
-                }
+                    .ok_or("unsupported feed entity")?;
+                append_item_text(format, &path, &mut current, &character.to_string());
             }
             Event::Eof => break,
             _ => {}
         }
     }
-    if !saw_feed {
-        return Err("response is not an Atom feed".into());
+    if format.is_none() || matches!(format, Some(FeedFormat::Rss)) && !saw_channel {
+        return Err("response is not an Atom or RSS feed".into());
     }
     Ok(entries.join("\n"))
+}
+
+fn append_item_text(
+    format: Option<FeedFormat>,
+    path: &[String],
+    current: &mut Option<Entry>,
+    text: &str,
+) {
+    let Some(format) = format else { return };
+    let item_path = format.item_path();
+    if path.len() != item_path.len() + 1
+        || !path
+            .iter()
+            .zip(item_path)
+            .all(|(actual, expected)| actual == expected)
+    {
+        return;
+    }
+    if let Some(entry) = current {
+        match (format, path.last().map(String::as_str)) {
+            (FeedFormat::Atom, Some("id")) | (FeedFormat::Rss, Some("guid")) => {
+                entry.id.push_str(text)
+            }
+            (_, Some("title")) => entry.title.push_str(text),
+            (FeedFormat::Rss, Some("link")) => entry.link.push_str(text),
+            _ => {}
+        }
+    }
 }
 
 fn one_line(value: &str) -> String {
@@ -189,7 +248,7 @@ mod tests {
             rendered,
             "Fix & test — https://example.com/1\nOther — https://example.com/2"
         );
-        assert!(is_atom_content_type(&resource.content_type));
+        assert!(is_feed_content_type(&resource.content_type));
         assert_eq!(
             diff("Other — https://example.com/2", &rendered, DiffMode::Added),
             "+Fix & test — https://example.com/1"
@@ -202,5 +261,41 @@ mod tests {
             ),
             "-Fix & test — https://example.com/1"
         );
+    }
+
+    #[test]
+    fn rss_items_render_and_diff_with_entities_and_cdata() {
+        let resource = Resource {
+            url: "https://static.crates.io/rss/updates.xml".into(),
+            content_type: "text/xml; charset=utf-8".into(),
+            content: r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Crates.io updates</title><item><title>serde &amp; friends 1.0</title><link>https://crates.io/crates/serde/1.0</link><guid>serde-1.0</guid></item><item><title><![CDATA[quick xml 2.0]]></title><guid>https://crates.io/crates/quick-xml/2.0</guid></item><item><title>Title only</title><guid isPermaLink="false">opaque-id</guid></item></channel></rss>"#.into(),
+        };
+        let rendered = render(&resource).unwrap();
+        assert_eq!(
+            rendered,
+            "serde & friends 1.0 — https://crates.io/crates/serde/1.0\nquick xml 2.0 — https://crates.io/crates/quick-xml/2.0\nTitle only"
+        );
+        assert!(!is_feed_content_type(&resource.content_type));
+        assert!(is_feed_content_type("application/rss+xml; charset=utf-8"));
+        assert_eq!(
+            diff(
+                "quick xml 2.0 — https://crates.io/crates/quick-xml/2.0\nTitle only",
+                &rendered,
+                DiffMode::Added
+            ),
+            "+serde & friends 1.0 — https://crates.io/crates/serde/1.0"
+        );
+    }
+
+    #[test]
+    fn rejects_non_feed_xml_and_rss_without_channel() {
+        let mut resource = Resource {
+            url: "https://example.com/other.xml".into(),
+            content_type: "text/xml".into(),
+            content: "<html><title>Not a feed</title></html>".into(),
+        };
+        assert!(render(&resource).is_err());
+        resource.content = "<rss version=\"2.0\"></rss>".into();
+        assert!(render(&resource).is_err());
     }
 }
