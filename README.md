@@ -4,6 +4,17 @@ Euka is an experimental shell for humans and coding agents. You type shell comma
 
 Euka is short for eukaryotic, cells evolved from archaea and bacterial partners such as the mitochondria, coming together to form a more complex cell. Euka uses the same idea: it brings a shell and coding agents into one session. The shell runs your commands and various agents handle coding requests amongst each other.
 
+## Install
+
+With Rust and Cargo installed, install the package from crates.io and start Euka:
+
+```sh
+cargo install euka-shell
+euka
+```
+
+The package is named `euka-shell`; the executable is `euka`.
+
 ## Why use Euka
 
 A coding agent can usually change all the files in your project. Euka gives you more control:
@@ -22,13 +33,11 @@ Euka does not give full protection. Read [Limits of the protection](#limits-of-t
 ## Requirements
 
 - macOS or Linux.
-- Rust and Cargo, to build Euka.
+- Rust and Cargo, to install or build Euka.
 - One or more agent CLIs, installed and authenticated: Claude Code, Codex, or Pi.
 - Optional, on macOS: Apple's `fm` CLI, with its license accepted.
 
 ## Build and run
-
-Install the published package with `cargo install euka-shell`; it provides the `euka` command.
 
 Run `make` to rebuild both debug and release binaries. Use `make debug` or `make release` for just one, and `make test` to run the tests. The binaries are at `target/debug/euka` and `target/release/euka`.
 
