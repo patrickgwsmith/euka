@@ -1,9 +1,15 @@
 [package]
-name = "euka"
+name = "euka-shell"
 version = "0.1.0"
 edition = "2021"
 description = "A small shared shell for humans and coding agents"
 license = "Apache-2.0"
+repository = "https://github.com/patrickgwsmith/euka"
+readme = "README.md"
+
+[[bin]]
+name = "euka"
+path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"

@@ -46,7 +46,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "euka"
+name = "euka-shell"
 version = "0.1.0"
 dependencies = [
  "libc",

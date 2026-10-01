@@ -28,6 +28,8 @@ Euka does not give full protection. Read [Limits of the protection](#limits-of-t
 
 ## Build and run
 
+Install the published package with `cargo install euka-shell`; it provides the `euka` command.
+
 Run `make` to rebuild both debug and release binaries. Use `make debug` or `make release` for just one, and `make test` to run the tests. The binaries are at `target/debug/euka` and `target/release/euka`.
 
 To build and start Euka in one step, run `cargo run`. Run `cargo run -- --help` to show help and exit. At the Euka prompt, enter `?` to show a cheatsheet of prefixes and built-in commands. On macOS, the cheatsheet also shows the command that creates the `staffer` account.
