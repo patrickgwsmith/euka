@@ -6,6 +6,21 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellExecution {
+    CurrentUser,
+    Staffer,
+}
+
+impl ShellExecution {
+    pub fn suffix(self) -> char {
+        match self {
+            Self::CurrentUser => '!',
+            Self::Staffer => '?',
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Token {
     Word(String),
@@ -251,18 +266,23 @@ fn owned_git_root(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn execute_host_shell(program: &str, script: &str, reader: bool) -> Result<i32, String> {
+pub fn execute_host_shell(
+    program: &str,
+    script: &str,
+    execution: ShellExecution,
+) -> Result<i32, String> {
     if script.trim().is_empty() {
         return Err(format!(
             "{program}{}: expected a command",
-            if reader { '?' } else { '!' }
+            execution.suffix()
         ));
     }
-    let mut child = if reader {
-        let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-        reader_shell_command(program, &cwd, unsafe { libc::isatty(0) } != 1)
-    } else {
-        Command::new(program)
+    let mut child = match execution {
+        ShellExecution::Staffer => {
+            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+            reader_shell_command(program, &cwd, unsafe { libc::isatty(0) } != 1)
+        }
+        ShellExecution::CurrentUser => Command::new(program),
     };
     child.arg("-c").arg(script);
     unsafe {
@@ -302,7 +322,11 @@ pub fn execute_substitution_shell(script: &str) -> Result<i32, String> {
     } else {
         "bash"
     };
-    execute_host_shell(program.unwrap_or(fallback), script, false)
+    execute_host_shell(
+        program.unwrap_or(fallback),
+        script,
+        ShellExecution::CurrentUser,
+    )
 }
 
 pub fn execute(input: &str, last_status: i32) -> Result<Outcome, String> {

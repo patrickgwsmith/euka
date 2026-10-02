@@ -1,3 +1,4 @@
+use crate::shell::ShellExecution;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -46,6 +47,70 @@ impl AgentAccess {
         match self {
             Self::ReadOnly => "read-only",
             Self::ReadWrite => "read-write",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentModel {
+    Fm,
+    Claude,
+    Fable,
+    Opus,
+    Sonnet,
+    Haiku,
+    Codex,
+    Sol,
+    Luna,
+    Terra,
+    Pi,
+    Jsc,
+}
+
+impl AgentModel {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "fm" => Some(Self::Fm),
+            "claude" => Some(Self::Claude),
+            "fable" => Some(Self::Fable),
+            "opus" | "Opus" => Some(Self::Opus),
+            "sonnet" => Some(Self::Sonnet),
+            "haiku" => Some(Self::Haiku),
+            "codex" => Some(Self::Codex),
+            "sol" => Some(Self::Sol),
+            "luna" => Some(Self::Luna),
+            "terra" => Some(Self::Terra),
+            "pi" => Some(Self::Pi),
+            "jsc" if cfg!(target_os = "macos") => Some(Self::Jsc),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fm => "fm",
+            Self::Claude => "claude",
+            Self::Fable => "fable",
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+            Self::Codex => "codex",
+            Self::Sol => "sol",
+            Self::Luna => "luna",
+            Self::Terra => "terra",
+            Self::Pi => "pi",
+            Self::Jsc => "jsc",
+        }
+    }
+
+    pub fn from_emoji(selector: &str) -> Option<Self> {
+        match selector {
+            "🎵" | "🎶" => Some(Self::Opus),
+            "☀️" | "☀" => Some(Self::Sol),
+            "🌙" => Some(Self::Luna),
+            "🥧" => Some(Self::Pi),
+            "🍎" => Some(Self::Fm),
+            _ => None,
         }
     }
 }
@@ -130,7 +195,7 @@ pub enum Input<'a> {
     HostShell {
         program: &'static str,
         command: &'a str,
-        reader: bool,
+        execution: ShellExecution,
     },
     Comment(&'a str),
     ShowTodos,
@@ -161,11 +226,11 @@ pub enum Input<'a> {
     Agent {
         task: &'a str,
         access: AgentAccess,
-        model: Option<&'a str>,
+        model: Option<AgentModel>,
     },
     Agents {
         task: &'a str,
-        models: Vec<&'a str>,
+        models: Vec<AgentModel>,
     },
     AsStaffer(Box<Input<'a>>),
     UnavailableTarget {
@@ -173,7 +238,7 @@ pub enum Input<'a> {
         access: AgentAccess,
     },
     InteractiveAgent {
-        model: &'a str,
+        model: AgentModel,
         access: AgentAccess,
     },
     Reserved(&'a str),
@@ -267,25 +332,25 @@ pub fn classify(line: &str) -> Input<'_> {
         Input::HostShell {
             program: "bash",
             command,
-            reader: false,
+            execution: ShellExecution::CurrentUser,
         }
     } else if let Some(command) = shell_target(line, "zsh!") {
         Input::HostShell {
             program: "zsh",
             command,
-            reader: false,
+            execution: ShellExecution::CurrentUser,
         }
     } else if let Some(command) = shell_target(line, "bash?") {
         Input::HostShell {
             program: "bash",
             command,
-            reader: true,
+            execution: ShellExecution::Staffer,
         }
     } else if let Some(command) = shell_target(line, "zsh?") {
         Input::HostShell {
             program: "zsh",
             command,
-            reader: true,
+            execution: ShellExecution::Staffer,
         }
     } else if let Some(rest) = line.strip_prefix('?') {
         Input::Agent {
@@ -306,15 +371,14 @@ pub fn classify(line: &str) -> Input<'_> {
     } else if line.starts_with("https://") || line.starts_with("http://") {
         Input::Url(line.trim_end())
     } else if let Some((name, access)) = named_target(line) {
-        if is_agent_model(name) && line.split_whitespace().nth(1).is_none() {
+        if let Some(model) =
+            AgentModel::parse(name).filter(|_| line.split_whitespace().nth(1).is_none())
+        {
             // A bare agent opens interactively: `?` read-only, `!` read-write.
-            if name == "fm" {
+            if model == AgentModel::Fm {
                 Input::EnterFm
             } else {
-                Input::InteractiveAgent {
-                    model: name,
-                    access,
-                }
+                Input::InteractiveAgent { model, access }
             }
         } else {
             Input::UnavailableTarget { name, access }
@@ -326,39 +390,41 @@ pub fn classify(line: &str) -> Input<'_> {
     }
 }
 
-fn agent_request(line: &str) -> Option<(&str, AgentAccess, &str)> {
+fn agent_request(line: &str) -> Option<(AgentModel, AgentAccess, &str)> {
     let (selector, task) = line.split_once(char::is_whitespace)?;
-    let (model, access) = if let Some(model) = selector.strip_suffix('?') {
+    let (model, access) = if let Some(model) = AgentModel::from_emoji(selector) {
         (model, AgentAccess::ReadOnly)
+    } else if let Some(model) = selector.strip_suffix('?') {
+        (AgentModel::parse(model)?, AgentAccess::ReadOnly)
     } else {
-        (selector.strip_suffix('!')?, AgentAccess::ReadWrite)
+        (
+            AgentModel::parse(selector.strip_suffix('!')?)?,
+            AgentAccess::ReadWrite,
+        )
     };
-    (is_agent_model(model) && !task.trim().is_empty()).then_some((model, access, task.trim()))
+    (!task.trim().is_empty()).then_some((model, access, task.trim()))
 }
 
-fn multi_agent_request(line: &str) -> Option<(Vec<&str>, &str)> {
+fn multi_agent_request(line: &str) -> Option<(Vec<AgentModel>, &str)> {
     let space = line.find(char::is_whitespace)?;
     let names = line[..space].strip_suffix('?')?;
-    let models: Vec<&str> = names.split('/').collect();
+    let models = names
+        .split('/')
+        .map(AgentModel::parse)
+        .collect::<Option<Vec<_>>>()?;
     let task = line[space..].trim();
-    (models.len() > 1 && models.iter().all(|model| is_agent_model(model)) && !task.is_empty())
-        .then_some((models, task))
+    (models.len() > 1 && !task.is_empty()).then_some((models, task))
 }
 
 pub fn is_agent_model(model: &str) -> bool {
-    matches!(
-        model,
-        "fm" | "claude"
-            | "fable"
-            | "opus"
-            | "sonnet"
-            | "haiku"
-            | "codex"
-            | "sol"
-            | "luna"
-            | "terra"
-            | "pi"
-    ) || (cfg!(target_os = "macos") && model == "jsc")
+    AgentModel::parse(model).is_some()
+}
+
+fn canonical_agent_model(model: &str) -> &str {
+    match AgentModel::parse(model) {
+        Some(agent) => agent.name(),
+        None => model,
+    }
 }
 
 pub fn agent_reference(token: &str) -> Option<(&str, Option<AgentAccess>, usize)> {
@@ -373,7 +439,11 @@ pub fn agent_reference(token: &str) -> Option<(&str, Option<AgentAccess>, usize)
     if !is_agent_model(model) {
         return None;
     }
-    Some((model, access, parse_agent_id(number)?))
+    Some((
+        canonical_agent_model(model),
+        access,
+        parse_agent_id(number)?,
+    ))
 }
 
 pub fn agent_number_reference(token: &str) -> Option<usize> {
@@ -431,8 +501,9 @@ fn shell_target<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 mod tests {
     use super::{
         agent_number_reference, agent_reference, classify, watch_revision_reference, AgentAccess,
-        DiffMode, Input,
+        AgentModel, DiffMode, Input,
     };
+    use crate::shell::ShellExecution;
 
     #[test]
     fn pasted_multiline_agent_task_is_one_request() {
@@ -441,7 +512,7 @@ mod tests {
             Input::Agent {
                 task: "Explain this:\nfirst line\nsecond line",
                 access: AgentAccess::ReadOnly,
-                model: Some("opus"),
+                model: Some(AgentModel::Opus),
             }
         ));
     }
@@ -496,7 +567,7 @@ mod tests {
         assert!(matches!(
             classify("fm? explain"),
             Input::Agent {
-                model: Some("fm"),
+                model: Some(AgentModel::Fm),
                 access: AgentAccess::ReadOnly,
                 task: "explain"
             }
@@ -504,7 +575,7 @@ mod tests {
         assert!(matches!(
             classify("fm! fix"),
             Input::Agent {
-                model: Some("fm"),
+                model: Some(AgentModel::Fm),
                 access: AgentAccess::ReadWrite,
                 task: "fix"
             }
@@ -520,7 +591,7 @@ mod tests {
             Input::Agent {
                 task: "explain the parser",
                 access: AgentAccess::ReadOnly,
-                model: Some("claude")
+                model: Some(AgentModel::Claude)
             }
         ));
         assert!(matches!(
@@ -530,7 +601,7 @@ mod tests {
         assert!(matches!(
             classify("claude! fix the parser"),
             Input::Agent {
-                model: Some("claude"),
+                model: Some(AgentModel::Claude),
                 access: AgentAccess::ReadWrite,
                 task: "fix the parser"
             }
@@ -552,12 +623,12 @@ mod tests {
                     task: "inspect this",
                     access: AgentAccess::ReadOnly,
                     model: Some(model)
-                } if model == name
+                } if model.name() == name
             ));
             let writable = format!("{name}! fix this");
             assert!(matches!(
                 classify(&writable),
-                Input::Agent { task: "fix this", access: AgentAccess::ReadWrite, model: Some(model) } if model == name
+                Input::Agent { task: "fix this", access: AgentAccess::ReadWrite, model: Some(model) } if model.name() == name
             ));
         }
         assert!(matches!(
@@ -565,7 +636,7 @@ mod tests {
             Input::Agent {
                 task: "Please add LICENSE with Apache-2.0 with my full name",
                 access: AgentAccess::ReadWrite,
-                model: Some("codex")
+                model: Some(AgentModel::Codex)
             }
         ));
     }
@@ -580,14 +651,49 @@ mod tests {
                     task: "inspect this",
                     access: AgentAccess::ReadOnly,
                     model: Some(model)
-                } if model == name
+                } if model.name() == name
             ));
             let writable = format!("{name}! fix this");
             assert!(matches!(
                 classify(&writable),
-                Input::Agent { task: "fix this", access: AgentAccess::ReadWrite, model: Some(model) } if model == name
+                Input::Agent { task: "fix this", access: AgentAccess::ReadWrite, model: Some(model) } if model.name() == name
             ));
         }
+    }
+
+    #[test]
+    fn capitalized_opus_uses_the_opus_model() {
+        assert!(matches!(
+            classify("Opus? inspect this"),
+            Input::Agent {
+                task: "inspect this",
+                access: AgentAccess::ReadOnly,
+                model: Some(AgentModel::Opus)
+            }
+        ));
+        assert!(matches!(
+            classify("Opus! fix this"),
+            Input::Agent {
+                task: "fix this",
+                access: AgentAccess::ReadWrite,
+                model: Some(AgentModel::Opus)
+            }
+        ));
+        assert!(matches!(
+            classify("Opus?"),
+            Input::InteractiveAgent {
+                model: AgentModel::Opus,
+                access: AgentAccess::ReadOnly
+            }
+        ));
+        assert!(matches!(
+            classify("Opus/luna? compare"),
+            Input::Agents { models, task: "compare" } if models == [AgentModel::Opus, AgentModel::Luna]
+        ));
+        assert_eq!(
+            agent_reference("Opus?#3"),
+            Some(("opus", Some(AgentAccess::ReadOnly), 3))
+        );
     }
 
     #[test]
@@ -600,14 +706,43 @@ mod tests {
                     task: "inspect this",
                     access: AgentAccess::ReadOnly,
                     model: Some(model)
-                } if model == name
+                } if model.name() == name
             ));
             let writable = format!("{name}! fix this");
             assert!(matches!(
                 classify(&writable),
-                Input::Agent { task: "fix this", access: AgentAccess::ReadWrite, model: Some(model) } if model == name
+                Input::Agent { task: "fix this", access: AgentAccess::ReadWrite, model: Some(model) } if model.name() == name
             ));
         }
+    }
+
+    #[test]
+    fn emoji_aliases_are_read_only_agent_requests() {
+        for (selector, model) in [
+            ("🎵", "opus"),
+            ("🎶", "opus"),
+            ("☀️", "sol"),
+            ("☀", "sol"),
+            ("🌙", "luna"),
+            ("🥧", "pi"),
+            ("🍎", "fm"),
+        ] {
+            let line = format!("{selector} inspect this");
+            assert!(matches!(
+                classify(&line),
+                Input::Agent {
+                    task: "inspect this",
+                    access: AgentAccess::ReadOnly,
+                    model: Some(actual)
+                } if actual.name() == model
+            ));
+        }
+        assert!(matches!(classify("☀️inspect"), Input::Shell(_)));
+        assert!(matches!(classify("🌙inspect"), Input::Shell(_)));
+        assert!(matches!(classify("🎵inspect"), Input::Shell(_)));
+        assert!(matches!(classify("🎶inspect"), Input::Shell(_)));
+        assert!(matches!(classify("🥧inspect"), Input::Shell(_)));
+        assert!(matches!(classify("🍎inspect"), Input::Shell(_)));
     }
 
     #[test]
@@ -615,17 +750,17 @@ mod tests {
         assert!(matches!(
             classify("opus/luna? what replaces tree?"),
             Input::Agents { task: "what replaces tree?", models }
-                if models == ["opus", "luna"]
+                if models == [AgentModel::Opus, AgentModel::Luna]
         ));
         assert!(matches!(
             classify("fm/sol/sonnet? inspect this"),
             Input::Agents { task: "inspect this", models }
-                if models == ["fm", "sol", "sonnet"]
+                if models == [AgentModel::Fm, AgentModel::Sol, AgentModel::Sonnet]
         ));
         assert!(matches!(
             classify("opus? luna? inspect this"),
             Input::Agent {
-                model: Some("opus"),
+                model: Some(AgentModel::Opus),
                 task: "luna? inspect this",
                 ..
             }
@@ -639,7 +774,7 @@ mod tests {
             Input::AsStaffer(inner) if matches!(*inner, Input::Agent {
                 task: "Is there a LICENSE?",
                 access: AgentAccess::ReadOnly,
-                model: Some("opus")
+                model: Some(AgentModel::Opus)
             })
         ));
         assert!(matches!(
@@ -647,7 +782,7 @@ mod tests {
             Input::AsStaffer(inner) if matches!(*inner, Input::Agent {
                 task: "add LICENSE",
                 access: AgentAccess::ReadWrite,
-                model: Some("codex")
+                model: Some(AgentModel::Codex)
             })
         ));
         assert!(matches!(
@@ -767,7 +902,7 @@ mod tests {
             Input::HostShell {
                 program: "bash",
                 command: "echo a | tr a b",
-                reader: false
+                execution: ShellExecution::CurrentUser
             }
         ));
         assert!(matches!(
@@ -775,7 +910,7 @@ mod tests {
             Input::HostShell {
                 program: "zsh",
                 command: "printf '%s\\n' *.rs",
-                reader: false
+                execution: ShellExecution::CurrentUser
             }
         ));
         assert!(matches!(
@@ -783,7 +918,7 @@ mod tests {
             Input::HostShell {
                 program: "bash",
                 command: "git status",
-                reader: true
+                execution: ShellExecution::Staffer
             }
         ));
         assert!(matches!(
@@ -791,7 +926,7 @@ mod tests {
             Input::HostShell {
                 program: "zsh",
                 command: "pwd",
-                reader: true
+                execution: ShellExecution::Staffer
             }
         ));
         assert!(matches!(classify("bash!file"), Input::Shell("bash!file")));
@@ -835,14 +970,14 @@ mod tests {
         assert!(matches!(
             classify("opus?"),
             Input::InteractiveAgent {
-                model: "opus",
+                model: AgentModel::Opus,
                 access: AgentAccess::ReadOnly
             }
         ));
         assert!(matches!(
             classify("  codex!  "),
             Input::InteractiveAgent {
-                model: "codex",
+                model: AgentModel::Codex,
                 access: AgentAccess::ReadWrite
             }
         ));

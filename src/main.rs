@@ -14,8 +14,8 @@ mod terminal;
 
 use agent_cli::AgentUser;
 use session::{
-    AgentAccess, DiffMode, Event, FeedSelection, Input, LiveCommand, LiveTarget, PromptMode,
-    Resource, Session,
+    AgentAccess, AgentModel, DiffMode, Event, FeedSelection, Input, LiveCommand, LiveTarget,
+    PromptMode, Resource, Session,
 };
 use shell::Outcome;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -36,7 +36,7 @@ struct AgentUpdate {
 
 struct QueuedAgent {
     id: usize,
-    model: String,
+    model: AgentModel,
     task: String,
     cwd: PathBuf,
     access: AgentAccess,
@@ -151,7 +151,13 @@ fn highlight_inline(mut text: &str, output: &mut String) {
 struct HttpRequest {
     id: usize,
     url: String,
-    head: bool,
+    kind: HttpRequestKind,
+}
+
+#[derive(Clone, Copy)]
+enum HttpRequestKind {
+    Load,
+    Head,
 }
 
 struct HttpUpdate {
@@ -446,7 +452,7 @@ fn handle(
         Input::Agent {
             task: line.trim(),
             access: AgentAccess::ReadOnly,
-            model: Some("fm"),
+            model: Some(AgentModel::Fm),
         }
     } else {
         classified
@@ -490,9 +496,9 @@ fn handle(
         Input::HostShell {
             program,
             command,
-            reader,
+            execution,
         } => {
-            let status = match shell::execute_host_shell(program, command, reader) {
+            let status = match shell::execute_host_shell(program, command, execution) {
                 Ok(status) => status,
                 Err(error) => {
                     eprintln!("euka: {error}");
@@ -501,7 +507,7 @@ fn handle(
             };
             session.last_status = status;
             session.events.push(Event::Command {
-                input: format!("{program}{} {command}", if reader { '?' } else { '!' }),
+                input: format!("{program}{} {command}", execution.suffix()),
                 status,
             });
         }
@@ -668,20 +674,21 @@ fn handle(
             ),
             _ => unreachable!(),
         },
-        Input::Url(url) => start_http(url, false, session, workers),
-        Input::Head(url) => start_http(url, true, session, workers),
+        Input::Url(url) => start_http(url, HttpRequestKind::Load, session, workers),
+        Input::Head(url) => start_http(url, HttpRequestKind::Head, session, workers),
         Input::UnavailableTarget { name, access } => {
             eprintln!("euka: target '{name}{}' is not available", access.suffix());
             session.last_status = 1;
         }
         Input::InteractiveAgent { model, access } => {
             println!(
-                "[{model} interactive {} session; exit it to return to euka]",
+                "[{} interactive {} session; exit it to return to euka]",
+                model.name(),
                 access.description()
             );
             let _ = io::stdout().flush();
             let status = match interactive_agent(model, &session.cwd, access) {
-                Ok(command) => agent_cli::run_interactive(command, model),
+                Ok(command) => agent_cli::run_interactive(command, model.name()),
                 Err(error) => {
                     eprintln!("euka: {error}");
                     1
@@ -689,7 +696,7 @@ fn handle(
             };
             session.last_status = status;
             session.events.push(Event::Command {
-                input: format!("{model}{}", access.suffix()),
+                input: format!("{}{}", model.name(), access.suffix()),
                 status,
             });
         }
@@ -703,7 +710,7 @@ fn handle(
 }
 
 fn run_agent(
-    model: &str,
+    model: AgentModel,
     task: &str,
     cwd: &Path,
     context: &str,
@@ -712,32 +719,37 @@ fn run_agent(
     user: AgentUser,
 ) -> Result<String, String> {
     match model {
-        "fm" => fm::run(task, cwd, context, references, access),
-        "claude" => claude::run(task, cwd, context, None, access, user),
-        "fable" | "opus" | "sonnet" | "haiku" => {
-            claude::run(task, cwd, context, Some(model), access, user)
+        AgentModel::Fm => fm::run(task, cwd, context, references, access),
+        AgentModel::Claude => claude::run(task, cwd, context, None, access, user),
+        AgentModel::Fable | AgentModel::Opus | AgentModel::Sonnet | AgentModel::Haiku => {
+            claude::run(task, cwd, context, Some(model.name()), access, user)
         }
-        "codex" => codex::run(task, cwd, context, None, access, user),
-        "sol" => codex::run(task, cwd, context, Some("gpt-6-sol"), access, user),
-        "luna" => codex::run(task, cwd, context, Some("gpt-6-luna"), access, user),
-        "terra" => codex::run(task, cwd, context, Some("gpt-5.6-terra"), access, user),
-        "pi" => pi::run(task, cwd, context, access, user),
-        "jsc" => jsc::run(task, cwd, access, user),
-        _ => unreachable!(),
+        AgentModel::Codex => codex::run(task, cwd, context, None, access, user),
+        AgentModel::Sol => codex::run(task, cwd, context, Some("gpt-6-sol"), access, user),
+        AgentModel::Luna => codex::run(task, cwd, context, Some("gpt-6-luna"), access, user),
+        AgentModel::Terra => codex::run(task, cwd, context, Some("gpt-5.6-terra"), access, user),
+        AgentModel::Pi => pi::run(task, cwd, context, access, user),
+        AgentModel::Jsc => jsc::run(task, cwd, access, user),
     }
 }
 
-fn interactive_agent(model: &str, cwd: &Path, access: AgentAccess) -> Result<Command, String> {
+fn interactive_agent(
+    model: AgentModel,
+    cwd: &Path,
+    access: AgentAccess,
+) -> Result<Command, String> {
     match model {
-        "claude" => claude::interactive(cwd, None, access),
-        "fable" | "opus" | "sonnet" | "haiku" => claude::interactive(cwd, Some(model), access),
-        "codex" => codex::interactive(cwd, None, access),
-        "sol" => codex::interactive(cwd, Some("gpt-6-sol"), access),
-        "luna" => codex::interactive(cwd, Some("gpt-6-luna"), access),
-        "terra" => codex::interactive(cwd, Some("gpt-5.6-terra"), access),
-        "pi" => pi::interactive(cwd, access),
-        "jsc" => jsc::interactive(cwd, access),
-        _ => unreachable!(),
+        AgentModel::Fm => Err("fm uses Euka's built-in interactive mode".to_owned()),
+        AgentModel::Claude => claude::interactive(cwd, None, access),
+        AgentModel::Fable | AgentModel::Opus | AgentModel::Sonnet | AgentModel::Haiku => {
+            claude::interactive(cwd, Some(model.name()), access)
+        }
+        AgentModel::Codex => codex::interactive(cwd, None, access),
+        AgentModel::Sol => codex::interactive(cwd, Some("gpt-6-sol"), access),
+        AgentModel::Luna => codex::interactive(cwd, Some("gpt-6-luna"), access),
+        AgentModel::Terra => codex::interactive(cwd, Some("gpt-5.6-terra"), access),
+        AgentModel::Pi => pi::interactive(cwd, access),
+        AgentModel::Jsc => jsc::interactive(cwd, access),
     }
 }
 
@@ -754,6 +766,7 @@ fn resolve_inline(
         match part {
             inline::Part::Literal(text) => resolved.push_str(text),
             inline::Part::Agent { model, task } => {
+                let agent_model = AgentModel::parse(model).ok_or("unknown inline agent model")?;
                 let references = ready_references(task, session, workers)?;
                 let id = workers.next_result_id();
                 let mut context =
@@ -775,7 +788,7 @@ fn resolve_inline(
                 );
                 let _ = io::stdout().flush();
                 let answer = run_agent(
-                    model,
+                    agent_model,
                     task,
                     &session.cwd,
                     &context,
@@ -811,20 +824,17 @@ fn resolve_inline(
 fn start_agents(
     task: &str,
     access: AgentAccess,
-    models: &[&str],
+    models: &[AgentModel],
     user: AgentUser,
     session: &mut Session,
     workers: &mut Workers,
 ) {
-    if task.is_empty()
-        || models.is_empty()
-        || !models.iter().all(|model| session::is_agent_model(model))
-    {
+    if task.is_empty() || models.is_empty() {
         eprintln!("euka: agent unavailable or task is empty");
         session.last_status = 1;
         return;
     }
-    if user == AgentUser::Staffer && models.contains(&"fm") {
+    if user == AgentUser::Staffer && models.contains(&AgentModel::Fm) {
         eprintln!("euka: fm cannot run as staffer");
         session.last_status = 1;
         return;
@@ -838,17 +848,18 @@ fn start_agents(
         }
     };
     for &model in models {
+        let name = model.name();
         let id = workers.next_result_id();
         workers.active_agents += 1;
         session.events.push(Event::AgentRequest {
             id,
             input: task.into(),
             access,
-            model: Some(model.to_owned()),
+            model: Some(name.to_owned()),
         });
         let request = QueuedAgent {
             id,
-            model: model.to_owned(),
+            model,
             task: task.to_owned(),
             cwd: session.cwd.clone(),
             access,
@@ -857,7 +868,7 @@ fn start_agents(
         let status = match &references {
             ReferenceResolution::Ready(references) => {
                 launch_agent(request, references.clone(), session, workers);
-                render_agent(model, access, id, AgentDisplay::Working)
+                render_agent(name, access, id, AgentDisplay::Working)
             }
             ReferenceResolution::Pending(ids) => {
                 let waiting_for = ids
@@ -867,7 +878,7 @@ fn start_agents(
                     .join(", ");
                 let status = format!(
                     "{}: waiting for {waiting_for}",
-                    agent_label(model, access, id)
+                    agent_label(name, access, id)
                 );
                 workers.pending_agents.insert(id, status.clone());
                 workers.queued_agents.insert(id, request);
@@ -897,15 +908,16 @@ fn launch_agent(
         user,
     } = request;
     let references = references.text;
-    workers
-        .pending_agents
-        .insert(id, render_agent(&model, access, id, AgentDisplay::Working));
+    workers.pending_agents.insert(
+        id,
+        render_agent(model.name(), access, id, AgentDisplay::Working),
+    );
     let tx = workers.worker_tx.clone();
     std::thread::spawn(move || {
-        let result = run_agent(&model, &task, &cwd, &context, &references, access, user);
+        let result = run_agent(model, &task, &cwd, &context, &references, access, user);
         let _ = tx.send(WorkerUpdate::Agent(AgentUpdate {
             id,
-            model,
+            model: model.name().to_owned(),
             access,
             result,
         }));
@@ -925,7 +937,7 @@ fn agent_context(
     };
     context.push_str(&format!(
         "request ({}, {}, {username}): {}\n",
-        agent_label(&request.model, request.access, request.id),
+        agent_label(request.model.name(), request.access, request.id),
         request.access.description(),
         request.task
     ));
@@ -1138,7 +1150,7 @@ fn diff_lines(previous: &str, current: &str, mode: DiffMode) -> String {
     lines.join("\n")
 }
 
-fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Workers) {
+fn start_http(url: &str, kind: HttpRequestKind, session: &mut Session, workers: &mut Workers) {
     let origin = match http::origin(url) {
         Ok(origin) => origin,
         Err(error) => {
@@ -1154,13 +1166,16 @@ fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Worker
         std::thread::spawn(move || {
             let client = http::agent();
             while let Ok(request) = receiver.recv() {
-                let result = if request.head {
-                    http::head(&client, &request.url).map(|output| HttpResult::Head {
-                        url: request.url,
-                        output,
-                    })
-                } else {
-                    http::load(&client, &request.url).map(HttpResult::Resource)
+                let result = match request.kind {
+                    HttpRequestKind::Head => {
+                        http::head(&client, &request.url).map(|output| HttpResult::Head {
+                            url: request.url,
+                            output,
+                        })
+                    }
+                    HttpRequestKind::Load => {
+                        http::load(&client, &request.url).map(HttpResult::Resource)
+                    }
                 };
                 if updates
                     .send(WorkerUpdate::Http(HttpUpdate {
@@ -1179,7 +1194,7 @@ fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Worker
         .send(HttpRequest {
             id,
             url: url.to_owned(),
-            head,
+            kind,
         })
         .is_err()
     {
@@ -1188,7 +1203,7 @@ fn start_http(url: &str, head: bool, session: &mut Session, workers: &mut Worker
     } else {
         workers.active_http += 1;
         session.last_status = 0;
-        if !head {
+        if matches!(kind, HttpRequestKind::Load) {
             println!("[url #{id} loading] {url}");
         }
     }
@@ -1228,14 +1243,20 @@ fn print_help() {
         "  claude? task        Ask Claude Code to inspect the project (background)",
         "  fable? task         Ask Claude Code with Fable (background)",
         "  opus? task          Ask Claude Code with Opus (background)",
+        "  Opus? task          Same as opus? task",
+        "  🎵 task, 🎶 task     Aliases for opus? task",
         "  sonnet? task        Ask Claude Code with Sonnet (background)",
         "  haiku? task         Ask Claude Code with Haiku (background)",
         "  codex? task         Ask Codex to inspect the project (background)",
         "  sol? task           Ask GPT-6 Sol through Codex (background)",
         "  luna? task          Ask GPT-6 Luna through Codex (background)",
+        "  ☀️ task             Alias for sol? task",
+        "  🌙 task             Alias for luna? task",
         "  terra? task         Ask GPT-5.6 Terra through Codex (background)",
         "  pi? task            Ask Pi to inspect the project (background)",
+        "  🥧 task             Alias for pi? task",
         "  fm? task            Ask Apple Foundation Models to investigate (background)",
+        "  🍎 task             Alias for fm? task",
         "  fm! task            Ask Apple Foundation Models to change files (background)",
         "  name! task          Ask a named agent to change files as your user",
         "  opus/luna? task     Ask both agents the same task (background)",
@@ -1771,7 +1792,7 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
                     id,
                     format!(
                         "{}: waiting for {status}",
-                        agent_label(&request.model, request.access, id)
+                        agent_label(request.model.name(), request.access, id)
                     ),
                 );
             }
@@ -1779,7 +1800,7 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
                 let request = workers.queued_agents.remove(&id).unwrap();
                 let _ = workers.worker_tx.send(WorkerUpdate::Agent(AgentUpdate {
                     id,
-                    model: request.model,
+                    model: request.model.name().to_owned(),
                     access: request.access,
                     result: Err(format!("referenced reply unavailable: {error}")),
                 }));
@@ -1797,7 +1818,7 @@ mod tests {
         AgentDisplay, AgentUpdate, ReferenceResolution, Workers,
     };
     use crate::agent_cli::AgentUser;
-    use crate::session::{AgentAccess, DiffMode, Event, PromptMode, Session};
+    use crate::session::{AgentAccess, AgentModel, DiffMode, Event, PromptMode, Session};
     use crate::terminal::Terminal;
     use std::path::Path;
 
@@ -2059,7 +2080,7 @@ mod tests {
         start_agents(
             "summarize #2",
             AgentAccess::ReadOnly,
-            &["luna"],
+            &[AgentModel::Luna],
             AgentUser::Current,
             &mut session,
             &mut workers,
@@ -2146,7 +2167,7 @@ mod tests {
         start_agents(
             "summarize #2",
             AgentAccess::ReadOnly,
-            &["luna"],
+            &[AgentModel::Luna],
             AgentUser::Current,
             &mut session,
             &mut workers,

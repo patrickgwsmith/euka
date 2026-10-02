@@ -66,6 +66,10 @@ Euka supports these agent names:
 
 Each request runs in the background. You can continue to type commands while the agent works.
 
+For a short read-only request, use `🎵 task` or `🎶 task` for `opus? task`, `☀️ task` for `sol? task`, `🌙 task` for `luna? task`, `🥧 task` for `pi? task`, or `🍎 task` for `fm? task`.
+
+`Opus? task` also works as `opus? task`.
+
 You can paste a multiline request, including its `opus?` prefix, into the interactive prompt. Euka keeps the pasted line breaks in one request; press Enter after pasting to send it.
 
 Enter an agent name with no request, for example `opus?` or `codex!`, to open that agent's own interactive CLI in the terminal. With `?` the session is read-only, using the same read-only tools and macOS sandbox as a `?` request. With `!` it can change files, using the same tools and sandbox settings as a `!` request. Bare `jsc?` or `jsc!` opens the jsc REPL, and bare `fm?` or `fm!` enters fm mode. When you exit the agent, you return to the Euka prompt.

@@ -772,9 +772,10 @@ fn selector_highlight(line: &str) -> Option<(usize, usize, SelectorKind)> {
     } else if !live && matches!(selector, "bash!" | "zsh!") {
         SelectorKind::HostShell
     } else if !live
-        && (selector
-            .strip_suffix('!')
-            .is_some_and(crate::session::is_agent_model)
+        && (crate::session::AgentModel::from_emoji(selector).is_some()
+            || selector
+                .strip_suffix('!')
+                .is_some_and(crate::session::is_agent_model)
             || selector
                 .strip_suffix('?')
                 .is_some_and(|names| names.split('/').all(crate::session::is_agent_model)))
@@ -806,14 +807,15 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
         let built_ins: &[&str] = if staffer_agent {
             &[
                 "claude?", "claude!", "opus?", "opus!", "sonnet?", "sonnet!", "codex?", "codex!",
-                "sol?", "sol!", "luna?", "luna!", "terra?", "terra!", "pi?", "pi!",
+                "Opus?", "Opus!", "sol?", "sol!", "luna?", "luna!", "terra?", "terra!", "pi?",
+                "pi!",
             ]
         } else {
             &[
                 "cd", "exit", "export", "unset", "reset", "bash!", "zsh!", "bash?", "zsh?",
                 "@staffer", "fm?", "fm!", "claude?", "claude!", "opus?", "opus!", "sonnet?",
-                "sonnet!", "codex?", "codex!", "sol?", "sol!", "luna?", "luna!", "terra?",
-                "terra!", "pi?", "pi!",
+                "Opus?", "Opus!", "sonnet!", "codex?", "codex!", "sol?", "sol!", "luna?", "luna!",
+                "terra?", "terra!", "pi?", "pi!", "🎵", "🎶", "☀️", "🌙", "🥧", "🍎",
             ]
         };
         for built_in in built_ins {
@@ -1066,8 +1068,26 @@ mod tests {
             Some((0, 4, SelectorKind::HostShell))
         );
         assert_eq!(selector_highlight("unknown? inspect"), None);
+        assert_eq!(
+            selector_highlight("Opus? inspect"),
+            Some((0, 5, SelectorKind::Agent))
+        );
         assert_eq!(selector_highlight("echo opus/luna?"), None);
         assert_eq!(selector_highlight("+bash! echo hi"), None);
+        for emoji in ["🎵", "🎶", "🥧", "🍎"] {
+            assert_eq!(
+                selector_highlight(&format!("{emoji} inspect this")),
+                Some((0, emoji.len(), SelectorKind::Agent))
+            );
+        }
+        assert_eq!(
+            selector_highlight("☀️ inspect this"),
+            Some((0, "☀️".len(), SelectorKind::Agent))
+        );
+        assert_eq!(
+            selector_highlight("🌙 inspect this"),
+            Some((0, "🌙".len(), SelectorKind::Agent))
+        );
 
         let mut colored = Vec::new();
         write_input(&mut colored, "opus/luna? compare", true).unwrap();
