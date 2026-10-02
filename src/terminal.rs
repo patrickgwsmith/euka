@@ -1,8 +1,8 @@
+use crate::session::DisplayDetail;
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Default)]
@@ -56,6 +56,7 @@ pub enum ReadResult {
     Line(String),
     Interrupt,
     Eof,
+    Expand,
 }
 
 pub fn columns() -> usize {
@@ -109,6 +110,7 @@ impl Terminal {
         &mut self,
         prompt: &str,
         full_prompt: &str,
+        detail: DisplayDetail,
         color: bool,
         mut statuses: Vec<String>,
         mut notices: impl FnMut() -> (Vec<String>, Vec<String>),
@@ -119,20 +121,22 @@ impl Terminal {
         let mut history_pos = self.history.len();
         let mut saved = Vec::new();
         let mut last_kill = None;
-        let mut expanded_until = None;
         let mut display = EditorDisplay::default();
         write_statuses(io::stdout().lock(), &statuses)?;
-        redraw(&mut display, &bytes, cursor, &self.history, prompt, color)?;
+        redraw(
+            &mut display,
+            &bytes,
+            cursor,
+            &self.history,
+            prompt_for_display(prompt, full_prompt, detail),
+            color,
+        )?;
         loop {
             let key = match read_byte_timeout(100)? {
                 Some(key) => key,
                 None => {
-                    let expired = expanded_until.is_some_and(|until| Instant::now() >= until);
-                    if expired {
-                        expanded_until = None;
-                    }
                     let (updates, new_statuses) = notices();
-                    if expired || !updates.is_empty() || new_statuses != statuses {
+                    if !updates.is_empty() || new_statuses != statuses {
                         let mut stdout = io::stdout().lock();
                         clear_editor(&mut stdout, statuses.len(), &mut display)?;
                         write_notices(&mut stdout, &updates)?;
@@ -145,16 +149,13 @@ impl Terminal {
                             &bytes,
                             cursor,
                             &self.history,
-                            prompt_for_display(prompt, full_prompt, expanded_until),
+                            prompt_for_display(prompt, full_prompt, detail),
                             color,
                         )?;
                     }
                     continue;
                 }
             };
-            if expanded_until.is_some_and(|until| Instant::now() >= until) {
-                expanded_until = None;
-            }
             let previous_kill = last_kill.take();
             match key {
                 b'\r' | b'\n' => {
@@ -163,9 +164,9 @@ impl Terminal {
                     write!(
                         stdout,
                         "{}",
-                        prompt_for_display(prompt, full_prompt, expanded_until)
+                        prompt_for_display(prompt, full_prompt, detail)
                     )?;
-                    write_input(&mut stdout, &format_line(&bytes), color)?;
+                    write_entered_input(&mut stdout, &format_line(&bytes), color)?;
                     stdout.write_all(b"\r\n")?;
                     stdout.flush()?;
                     let line = String::from_utf8_lossy(&bytes).into_owned();
@@ -180,9 +181,9 @@ impl Terminal {
                     write!(
                         stdout,
                         "{}",
-                        prompt_for_display(prompt, full_prompt, expanded_until)
+                        prompt_for_display(prompt, full_prompt, detail)
                     )?;
-                    write_input(&mut stdout, &format_line(&bytes), color)?;
+                    write_entered_input(&mut stdout, &format_line(&bytes), color)?;
                     stdout.write_all(b"^C\r\n")?;
                     stdout.flush()?;
                     return Ok(ReadResult::Interrupt);
@@ -351,7 +352,10 @@ impl Terminal {
                                 cursor = bytes.len();
                             }
                             Some(b'B') if bytes.is_empty() => {
-                                expanded_until = Some(Instant::now() + Duration::from_secs(3));
+                                let mut stdout = io::stdout().lock();
+                                clear_editor(&mut stdout, statuses.len(), &mut display)?;
+                                stdout.flush()?;
+                                return Ok(ReadResult::Expand);
                             }
                             Some(b'C') if cursor == bytes.len() => {
                                 let line = format_line(&bytes);
@@ -401,18 +405,17 @@ impl Terminal {
                 &bytes,
                 cursor,
                 &self.history,
-                prompt_for_display(prompt, full_prompt, expanded_until),
+                prompt_for_display(prompt, full_prompt, detail),
                 color,
             )?;
         }
     }
 }
 
-fn prompt_for_display<'a>(short: &'a str, full: &'a str, until: Option<Instant>) -> &'a str {
-    if until.is_some_and(|deadline| Instant::now() < deadline) {
-        full
-    } else {
-        short
+fn prompt_for_display<'a>(short: &'a str, full: &'a str, detail: DisplayDetail) -> &'a str {
+    match detail {
+        DisplayDetail::Compact => short,
+        DisplayDetail::Expanded => full,
     }
 }
 
@@ -692,7 +695,7 @@ fn redraw(
     };
     let width = columns().saturating_sub(1).max(2);
     let mut styled = prompt.as_bytes().to_vec();
-    write_input(&mut styled, &line, color)?;
+    write_entered_input(&mut styled, &line, color)?;
     if !suggestion.is_empty() {
         write!(styled, "\x1b[2m{suggestion}\x1b[0m")?;
     }
@@ -713,24 +716,59 @@ fn redraw(
     stdout.flush()
 }
 
-fn write_input(mut output: impl Write, line: &str, color: bool) -> io::Result<()> {
-    if color {
-        if let Some((start, end, kind)) = selector_highlight(line) {
-            write!(
-                output,
-                "{}{}{}\x1b[0m",
-                &line[..start],
-                kind.ansi(),
-                &line[start..end]
-            )?;
-            if &line[start..end] == "@staffer" {
-                return write_input(output, &line[end..], color);
-            }
-            output.write_all(&line.as_bytes()[end..])?;
-            return Ok(());
-        }
+#[derive(Clone, Copy)]
+enum InputStyle {
+    Example,
+    Entered,
+}
+
+fn write_input(output: impl Write, line: &str, color: bool) -> io::Result<()> {
+    write_input_style(output, line, color, InputStyle::Example)
+}
+
+fn write_entered_input(output: impl Write, line: &str, color: bool) -> io::Result<()> {
+    write_input_style(output, line, color, InputStyle::Entered)
+}
+
+fn write_input_style(
+    mut output: impl Write,
+    line: &str,
+    color: bool,
+    style: InputStyle,
+) -> io::Result<()> {
+    if !color {
+        return output.write_all(line.as_bytes());
     }
-    output.write_all(line.as_bytes())
+    if matches!(style, InputStyle::Entered) {
+        output.write_all(b"\x1b[1m")?;
+    }
+    write_input_parts(&mut output, line, style)?;
+    if matches!(style, InputStyle::Entered) {
+        output.write_all(b"\x1b[0m")?;
+    }
+    Ok(())
+}
+
+fn write_input_parts(mut output: impl Write, line: &str, style: InputStyle) -> io::Result<()> {
+    if let Some((start, end, kind)) = selector_highlight(line) {
+        write!(
+            output,
+            "{}{}{}\x1b[0m",
+            &line[..start],
+            kind.ansi(),
+            &line[start..end]
+        )?;
+        if matches!(style, InputStyle::Entered) {
+            output.write_all(b"\x1b[1m")?;
+        }
+        if &line[start..end] == "@staffer" {
+            return write_input_parts(output, &line[end..], style);
+        }
+        output.write_all(&line.as_bytes()[end..])?;
+    } else {
+        output.write_all(line.as_bytes())?;
+    }
+    Ok(())
 }
 
 pub fn styled_input(line: &str, color: bool) -> String {
@@ -773,6 +811,11 @@ fn selector_highlight(line: &str) -> Option<(usize, usize, SelectorKind)> {
         SelectorKind::HostShell
     } else if !live
         && (crate::session::AgentModel::from_emoji(selector).is_some()
+            || ["!!", "!!!", "??", "???", "?!"].iter().any(|suffix| {
+                selector
+                    .strip_suffix(suffix)
+                    .is_some_and(|names| names.split('/').all(crate::session::is_agent_model))
+            })
             || selector
                 .strip_suffix('!')
                 .is_some_and(crate::session::is_agent_model)
@@ -821,6 +864,16 @@ fn completions_in(line: &str, cursor: usize, cwd: &Path) -> Completion {
         for built_in in built_ins {
             if built_in.starts_with(&value) {
                 names.insert(render_completion(built_in, style, false));
+            }
+        }
+        for model in [
+            "claude", "fable", "opus", "Opus", "sonnet", "haiku", "codex", "sol", "luna", "terra",
+        ] {
+            for suffix in ["??", "???", "!!", "!!!"] {
+                let selector = format!("{model}{suffix}");
+                if selector.starts_with(&value) {
+                    names.insert(render_completion(&selector, style, false));
+                }
             }
         }
         if let Some(paths) = command.then(|| std::env::var_os("PATH")).flatten() {
@@ -1012,9 +1065,10 @@ fn common_prefix(strings: &[String]) -> String {
 mod tests {
     use super::{
         backward_word, clear_editor, completions_in, forward_word, kill, normalize_paste,
-        selector_highlight, styled_input, write_input, write_notices, write_title, write_wrapped,
-        EditorDisplay, KillDirection, SelectorKind,
+        prompt_for_display, selector_highlight, styled_input, write_entered_input, write_input,
+        write_notices, write_title, write_wrapped, EditorDisplay, KillDirection, SelectorKind,
     };
+    use crate::session::DisplayDetail;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1023,6 +1077,18 @@ mod tests {
         let mut output = Vec::new();
         write_title(&mut output, "~/C/project\x1b]0;injected\x07").unwrap();
         assert_eq!(output, b"\x1b]2;~/C/project?]0;injected?\x1b\\");
+    }
+
+    #[test]
+    fn expanded_prompt_has_no_deadline() {
+        assert_eq!(
+            prompt_for_display("short> ", "full/path> ", DisplayDetail::Compact),
+            "short> "
+        );
+        assert_eq!(
+            prompt_for_display("short> ", "full/path> ", DisplayDetail::Expanded),
+            "full/path> "
+        );
     }
 
     #[test]
@@ -1071,6 +1137,18 @@ mod tests {
         assert_eq!(
             selector_highlight("Opus? inspect"),
             Some((0, 5, SelectorKind::Agent))
+        );
+        assert_eq!(
+            selector_highlight("opus?? inspect"),
+            Some((0, 6, SelectorKind::Agent))
+        );
+        assert_eq!(
+            selector_highlight("sol!!! inspect"),
+            Some((0, 6, SelectorKind::Agent))
+        );
+        assert_eq!(
+            selector_highlight("opus/luna?? compare"),
+            Some((0, 11, SelectorKind::Agent))
         );
         assert_eq!(selector_highlight("echo opus/luna?"), None);
         assert_eq!(selector_highlight("+bash! echo hi"), None);
@@ -1130,6 +1208,28 @@ mod tests {
     }
 
     #[test]
+    fn entered_commands_and_agent_tasks_are_bold() {
+        let mut output = Vec::new();
+        write_entered_input(&mut output, "ls", true).unwrap();
+        assert_eq!(output, b"\x1b[1mls\x1b[0m");
+        output.clear();
+        write_entered_input(&mut output, "opus? inspect this", true).unwrap();
+        assert_eq!(
+            output,
+            b"\x1b[1m\x1b[1;35mopus?\x1b[0m\x1b[1m inspect this\x1b[0m"
+        );
+        output.clear();
+        write_entered_input(&mut output, "@staffer opus? inspect", true).unwrap();
+        assert_eq!(
+            output,
+            b"\x1b[1m\x1b[1;34m@staffer\x1b[0m\x1b[1m \x1b[1;35mopus?\x1b[0m\x1b[1m inspect\x1b[0m"
+        );
+        output.clear();
+        write_entered_input(&mut output, "ls", false).unwrap();
+        assert_eq!(output, b"ls");
+    }
+
+    #[test]
     fn tab_completes_argument_paths_and_escapes_spaces() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1150,6 +1250,8 @@ mod tests {
         assert_eq!(matches("cat .h"), [".hidden "]);
         assert!(matches("@staffer opu").contains(&"opus? ".to_owned()));
         assert!(matches("@staffer opu").contains(&"opus! ".to_owned()));
+        assert!(matches("opus??").contains(&"opus??? ".to_owned()));
+        assert!(matches("sol!!").contains(&"sol!!! ".to_owned()));
         assert!(!matches("cat ").iter().any(|name| name.contains(".hidden")));
         let absolute = format!("cat {}/rep", root.display());
         assert_eq!(

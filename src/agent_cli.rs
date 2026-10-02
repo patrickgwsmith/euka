@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 
-use crate::session::AgentAccess;
+use crate::session::{AgentAccess, ReasoningEffort};
 
 pub const READ_ONLY_REPLY_INSTRUCTION: &str =
     "Answer in one concise plain-text line. Give the finding directly; omit headings and Markdown.";
@@ -25,6 +25,19 @@ const READ_ONLY_HOME_WRITABLE: &[(&str, bool)] = &[
 pub enum AgentUser {
     Current,
     Staffer,
+}
+
+/// One agent request as Claude Code and Codex receive it; `model` is the
+/// backend's own model name, or `None` for the CLI default.
+#[derive(Clone, Copy)]
+pub struct Request<'a> {
+    pub task: &'a str,
+    pub cwd: &'a Path,
+    pub context: &'a str,
+    pub model: Option<&'a str>,
+    pub access: AgentAccess,
+    pub user: AgentUser,
+    pub effort: ReasoningEffort,
 }
 
 pub fn command(program: &str, user: AgentUser) -> Command {

@@ -14,8 +14,8 @@ mod terminal;
 
 use agent_cli::AgentUser;
 use session::{
-    AgentAccess, AgentModel, DiffMode, Event, FeedSelection, Input, LiveCommand, LiveTarget,
-    PromptMode, Resource, Session,
+    AgentAccess, AgentModel, AgentOptions, AgentOutput, AgentTask, DiffMode, DisplayDetail, Event,
+    FeedSelection, Input, LiveCommand, LiveTarget, PromptMode, ReasoningEffort, Resource, Session,
 };
 use shell::Outcome;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -39,8 +39,19 @@ struct QueuedAgent {
     model: AgentModel,
     task: String,
     cwd: PathBuf,
-    access: AgentAccess,
-    user: AgentUser,
+    options: AgentOptions,
+}
+
+impl QueuedAgent {
+    fn label(&self) -> AgentLabel<'_> {
+        AgentLabel {
+            model: self.model.name(),
+            id: self.id,
+            access: self.options.access,
+            effort: self.options.effort,
+            output: self.options.output,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,18 +73,86 @@ enum AgentDisplay<'a> {
     Error(&'a str),
 }
 
-fn agent_label(model: &str, access: AgentAccess, id: usize) -> String {
-    format!("{model}{}#{id}", access.suffix())
+/// Whether rendered agent lines may use terminal colors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Styling {
+    Plain,
+    Terminal,
 }
 
-fn render_agent(model: &str, access: AgentAccess, id: usize, display: AgentDisplay<'_>) -> String {
-    let label = format!("{}:", agent_label(model, access, id));
-    match display {
-        AgentDisplay::Working => format!("{label} …"),
-        AgentDisplay::FullAnswer(text) | AgentDisplay::Answer(text) => {
-            format!("{label} {text}")
+/// Whether a recalled agent reply is preceded by the request that produced it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptLine {
+    Always,
+    WhenExpanded,
+}
+
+/// The name of an agent result, such as `opus?#3`, `opus??#3` or `opus?!#3`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AgentLabel<'a> {
+    model: &'a str,
+    id: usize,
+    access: AgentAccess,
+    effort: ReasoningEffort,
+    output: AgentOutput,
+}
+
+impl<'a> AgentLabel<'a> {
+    fn new(model: &'a str, access: AgentAccess, id: usize) -> Self {
+        Self {
+            model,
+            id,
+            access,
+            effort: ReasoningEffort::Default,
+            output: AgentOutput::Final,
         }
-        AgentDisplay::Error(text) => format!("{label} error: {text}"),
+    }
+
+    /// Applies the effort and live output recorded for this result.
+    fn in_session(self, session: &Session) -> Self {
+        Self {
+            effort: session
+                .agent_efforts
+                .get(&self.id)
+                .copied()
+                .unwrap_or(ReasoningEffort::Default),
+            output: if session.streaming_agents.contains(&self.id) {
+                AgentOutput::Live
+            } else {
+                AgentOutput::Final
+            },
+            ..self
+        }
+    }
+}
+
+impl std::fmt::Display for AgentLabel<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { model, id, .. } = self;
+        match self.output {
+            AgentOutput::Final => write!(
+                formatter,
+                "{model}{}#{id}",
+                self.access
+                    .suffix()
+                    .to_string()
+                    .repeat(self.effort.suffix_count())
+            ),
+            AgentOutput::Live => write!(formatter, "{model}?!#{id}"),
+        }
+    }
+}
+
+fn render_agent(label: AgentLabel<'_>, display: AgentDisplay<'_>, styling: Styling) -> String {
+    let color = styling == Styling::Terminal && output_color();
+    match display {
+        AgentDisplay::Working => format!("{label}: …"),
+        AgentDisplay::Answer(text) | AgentDisplay::FullAnswer(text) if color => {
+            format!("\x1b[1;35m{label}:\x1b[0m {}", highlight_answer(text))
+        }
+        AgentDisplay::Answer(text) | AgentDisplay::FullAnswer(text) => format!("{label}: {text}"),
+        AgentDisplay::Error(text) if color => format!("\x1b[1;31m{label}: error:\x1b[0m {text}"),
+        AgentDisplay::Error(text) => format!("{label}: error: {text}"),
     }
 }
 
@@ -83,24 +162,63 @@ fn output_color() -> bool {
         && std::env::var("TERM").ok().as_deref() != Some("dumb")
 }
 
-fn render_agent_output(
-    model: &str,
-    access: AgentAccess,
-    id: usize,
+/// Renders a reply already in the session, labeled with its recorded effort
+/// and output, optionally preceded by its request.
+fn render_session_agent(
+    session: &Session,
+    label: AgentLabel<'_>,
     display: AgentDisplay<'_>,
+    prompt: PromptLine,
 ) -> String {
-    let plain = render_agent(model, access, id, display);
-    if !output_color() || matches!(display, AgentDisplay::Working) {
-        return plain;
+    let label = label.in_session(session);
+    let result = render_agent(label, display, Styling::Terminal);
+    if prompt == PromptLine::WhenExpanded && !session.expanded_response_ids.contains(&label.id) {
+        return result;
     }
-    let label = format!("{}:", agent_label(model, access, id));
-    if let Some(body) = plain.strip_prefix(&format!("{label} error: ")) {
-        return format!("\x1b[1;31m{label} error:\x1b[0m {body}");
+    let Some(input) = session.events.iter().find_map(|event| match event {
+        Event::AgentRequest { id, input, .. } if *id == label.id => Some(input),
+        _ => None,
+    }) else {
+        return result;
+    };
+    let prompt = format!("{label} prompt: {input}");
+    format!("{}\n{result}", emphasize_prompt(&prompt, output_color()))
+}
+
+fn emphasize_prompt(prompt: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[1m{prompt}\x1b[0m")
+    } else {
+        prompt.to_owned()
     }
-    if let Some(body) = plain.strip_prefix(&format!("{label} ")) {
-        return format!("\x1b[1;35m{label}\x1b[0m {}", highlight_answer(body));
+}
+
+fn expanded_agent_results(session: &mut Session) -> Vec<String> {
+    let results: Vec<_> = session
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::AgentResponse { id, model, text }
+                if !session.expanded_response_ids.contains(id) =>
+            {
+                let label = agent_label_by_id(session, *id)?;
+                Some((
+                    *id,
+                    render_session_agent(
+                        session,
+                        AgentLabel { model, ..label },
+                        AgentDisplay::FullAnswer(text),
+                        PromptLine::Always,
+                    ),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    for (id, _) in &results {
+        session.expanded_response_ids.insert(*id);
     }
-    plain
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 fn highlight_answer(text: &str) -> String {
@@ -172,6 +290,7 @@ enum HttpResult {
 
 enum WorkerUpdate {
     Agent(AgentUpdate),
+    AgentProgress { id: usize, status: String },
     Http(HttpUpdate),
 }
 
@@ -266,23 +385,40 @@ fn main() {
             let short_prompt = prompt(session.mode, &session.cwd, false, color);
             let full_prompt = prompt(session.mode, &session.cwd, true, color);
             let statuses = workers.pending_agents.values().cloned().collect();
-            let line =
-                match terminal.read_line(&short_prompt, &full_prompt, color, statuses, || {
+            let line = match terminal.read_line(
+                &short_prompt,
+                &full_prompt,
+                session.detail,
+                color,
+                statuses,
+                || {
                     let updates = drain_updates(&mut workers, &mut session);
                     let statuses = workers.pending_agents.values().cloned().collect();
                     (updates, statuses)
-                }) {
-                    Ok(ReadResult::Line(line)) => line,
-                    Ok(ReadResult::Interrupt) => {
-                        session.mode = PromptMode::Shell;
-                        continue;
+                },
+            ) {
+                Ok(ReadResult::Line(line)) => {
+                    session.detail = DisplayDetail::Compact;
+                    line
+                }
+                Ok(ReadResult::Interrupt) => {
+                    session.detail = DisplayDetail::Compact;
+                    session.mode = PromptMode::Shell;
+                    continue;
+                }
+                Ok(ReadResult::Eof) => break,
+                Ok(ReadResult::Expand) => {
+                    session.detail = DisplayDetail::Expanded;
+                    for result in expanded_agent_results(&mut session) {
+                        println!("{result}");
                     }
-                    Ok(ReadResult::Eof) => break,
-                    Err(error) => {
-                        eprintln!("euka: terminal: {error}");
-                        break;
-                    }
-                };
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!("euka: terminal: {error}");
+                    break;
+                }
+            };
             if let Some(status) = handle(&line, &mut session, &mut workers, &mut terminal) {
                 std::process::exit(status);
             }
@@ -307,10 +443,9 @@ fn main() {
         while workers.active_agents + workers.active_http + workers.active_live > 0 {
             match workers.worker_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(update) => {
-                    println!(
-                        "{}",
-                        format_worker_update(update, &mut session, &mut workers)
-                    );
+                    if let Some(line) = format_worker_update(update, &mut session, &mut workers) {
+                        println!("{line}");
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -449,11 +584,11 @@ fn handle(
                 | Input::LatestAgentResponse
                 | Input::ShowTodos
         ) {
-        Input::Agent {
-            task: line.trim(),
-            access: AgentAccess::ReadOnly,
-            model: Some(AgentModel::Fm),
-        }
+        session::agents(
+            line.trim(),
+            vec![AgentModel::Fm],
+            AgentOptions::new(AgentAccess::ReadOnly),
+        )
     } else {
         classified
     };
@@ -513,10 +648,15 @@ fn handle(
         }
         Input::Comment(comment) => session.events.push(Event::Comment(comment.into())),
         Input::LatestAgentResponse => match latest_agent_response(session) {
-            Some((id, model, access, text)) => {
+            Some((label, text)) => {
                 println!(
                     "{}",
-                    render_agent_output(model, access, id, AgentDisplay::FullAnswer(text))
+                    render_session_agent(
+                        session,
+                        label,
+                        AgentDisplay::FullAnswer(text),
+                        PromptLine::WhenExpanded
+                    )
                 );
                 session.last_status = 0;
             }
@@ -527,10 +667,12 @@ fn handle(
         },
         Input::AgentReference { model, access, id } => {
             let result = if let Some(expected_access) = access {
-                if agent_request_by_id(session, id) != Some((model, expected_access)) {
+                if agent_label_by_id(session, id)
+                    .is_none_or(|label| label.model != model || label.access != expected_access)
+                {
                     Err(format!(
                         "no reply found for {}",
-                        agent_label(model, expected_access, id)
+                        AgentLabel::new(model, expected_access, id).in_session(session)
                     ))
                 } else {
                     agent_response(session, model, id, workers)
@@ -540,14 +682,14 @@ fn handle(
             };
             match result {
                 Ok(text) => {
-                    let actual_access = agent_access_by_id(session, id).unwrap();
+                    let label = agent_label_by_id(session, id).unwrap();
                     println!(
                         "{}",
-                        render_agent_output(
-                            model,
-                            actual_access,
-                            id,
-                            AgentDisplay::FullAnswer(text)
+                        render_session_agent(
+                            session,
+                            AgentLabel { model, ..label },
+                            AgentDisplay::FullAnswer(text),
+                            PromptLine::WhenExpanded
                         )
                     );
                     session.last_status = 0;
@@ -558,7 +700,7 @@ fn handle(
                 }
             }
         }
-        Input::AgentNumberReference { id } if agent_model_by_id(session, id).is_none() => {
+        Input::AgentNumberReference { id } if agent_label_by_id(session, id).is_none() => {
             match watch_response_by_id(session, id, None)
                 .or_else(|| http_response_by_id(session, id))
             {
@@ -595,10 +737,15 @@ fn handle(
             }
         }
         Input::AgentNumberReference { id } => match agent_response_by_id(session, id, workers) {
-            Ok((model, access, text)) => {
+            Ok((label, text)) => {
                 println!(
                     "{}",
-                    render_agent_output(model, access, id, AgentDisplay::FullAnswer(text))
+                    render_session_agent(
+                        session,
+                        label,
+                        AgentDisplay::FullAnswer(text),
+                        PromptLine::WhenExpanded
+                    )
                 );
                 session.last_status = 0;
             }
@@ -631,75 +778,18 @@ fn handle(
             session.mode = PromptMode::FmReadOnly;
             println!("[fm read-only mode; ., exit, or Ctrl-C returns to the shell]");
         }
-        Input::Agent {
-            task,
-            access,
-            model,
-        } => start_agents(
-            task,
-            access,
-            &model.into_iter().collect::<Vec<_>>(),
-            AgentUser::Current,
-            session,
-            workers,
-        ),
-        Input::Agents { task, models } => start_agents(
-            task,
-            AgentAccess::ReadOnly,
-            &models,
-            AgentUser::Current,
-            session,
-            workers,
-        ),
-        Input::AsStaffer(input) => match *input {
-            Input::Agent {
-                task,
-                access,
-                model,
-            } => start_agents(
-                task,
-                access,
-                &model.into_iter().collect::<Vec<_>>(),
-                AgentUser::Staffer,
-                session,
-                workers,
-            ),
-            Input::Agents { task, models } => start_agents(
-                task,
-                AgentAccess::ReadOnly,
-                &models,
-                AgentUser::Staffer,
-                session,
-                workers,
-            ),
-            _ => unreachable!(),
-        },
+        Input::Agents(request) => start_agents(request, session, workers),
         Input::Url(url) => start_http(url, HttpRequestKind::Load, session, workers),
         Input::Head(url) => start_http(url, HttpRequestKind::Head, session, workers),
         Input::UnavailableTarget { name, access } => {
             eprintln!("euka: target '{name}{}' is not available", access.suffix());
             session.last_status = 1;
         }
-        Input::InteractiveAgent { model, access } => {
-            println!(
-                "[{} interactive {} session; exit it to return to euka]",
-                model.name(),
-                access.description()
-            );
-            let _ = io::stdout().flush();
-            let status = match interactive_agent(model, &session.cwd, access) {
-                Ok(command) => agent_cli::run_interactive(command, model.name()),
-                Err(error) => {
-                    eprintln!("euka: {error}");
-                    1
-                }
-            };
-            session.last_status = status;
-            session.events.push(Event::Command {
-                input: format!("{}{}", model.name(), access.suffix()),
-                status,
-            });
-        }
+        Input::InteractiveAgent {
+            model,
+            access,
+            effort,
+        } => start_interactive_agent(model, access, effort, session),
         Input::Reserved(input) => {
             eprintln!("euka: reserved syntax is not available yet: {input}");
             session.last_status = 1;
@@ -711,25 +801,50 @@ fn handle(
 
 fn run_agent(
     model: AgentModel,
-    task: &str,
-    cwd: &Path,
-    context: &str,
+    request: agent_cli::Request<'_>,
     references: &str,
-    access: AgentAccess,
-    user: AgentUser,
+    output: AgentOutput,
+    progress: impl FnMut(String),
 ) -> Result<String, String> {
-    match model {
-        AgentModel::Fm => fm::run(task, cwd, context, references, access),
-        AgentModel::Claude => claude::run(task, cwd, context, None, access, user),
-        AgentModel::Fable | AgentModel::Opus | AgentModel::Sonnet | AgentModel::Haiku => {
-            claude::run(task, cwd, context, Some(model.name()), access, user)
+    let agent_cli::Request {
+        task,
+        cwd,
+        context,
+        access,
+        user,
+        ..
+    } = request;
+    match (model, output) {
+        (AgentModel::Fm, AgentOutput::Final) => fm::run(task, cwd, context, references, access),
+        (
+            AgentModel::Claude
+            | AgentModel::Fable
+            | AgentModel::Opus
+            | AgentModel::Sonnet
+            | AgentModel::Haiku,
+            AgentOutput::Final,
+        ) => claude::run(request),
+        (
+            AgentModel::Claude
+            | AgentModel::Fable
+            | AgentModel::Opus
+            | AgentModel::Sonnet
+            | AgentModel::Haiku,
+            AgentOutput::Live,
+        ) => claude::run_live(request, progress),
+        (
+            AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra,
+            AgentOutput::Final,
+        ) => codex::run(request),
+        (
+            AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra,
+            AgentOutput::Live,
+        ) => codex::run_live(request, progress),
+        (AgentModel::Pi, AgentOutput::Final) => pi::run(task, cwd, context, access, user),
+        (AgentModel::Jsc, AgentOutput::Final) => jsc::run(task, cwd, access, user),
+        (AgentModel::Fm | AgentModel::Pi | AgentModel::Jsc, AgentOutput::Live) => {
+            Err("live status is unavailable for this agent".to_owned())
         }
-        AgentModel::Codex => codex::run(task, cwd, context, None, access, user),
-        AgentModel::Sol => codex::run(task, cwd, context, Some("gpt-6-sol"), access, user),
-        AgentModel::Luna => codex::run(task, cwd, context, Some("gpt-6-luna"), access, user),
-        AgentModel::Terra => codex::run(task, cwd, context, Some("gpt-5.6-terra"), access, user),
-        AgentModel::Pi => pi::run(task, cwd, context, access, user),
-        AgentModel::Jsc => jsc::run(task, cwd, access, user),
     }
 }
 
@@ -737,20 +852,54 @@ fn interactive_agent(
     model: AgentModel,
     cwd: &Path,
     access: AgentAccess,
+    effort: ReasoningEffort,
 ) -> Result<Command, String> {
     match model {
         AgentModel::Fm => Err("fm uses Euka's built-in interactive mode".to_owned()),
-        AgentModel::Claude => claude::interactive(cwd, None, access),
-        AgentModel::Fable | AgentModel::Opus | AgentModel::Sonnet | AgentModel::Haiku => {
-            claude::interactive(cwd, Some(model.name()), access)
+        AgentModel::Claude
+        | AgentModel::Fable
+        | AgentModel::Opus
+        | AgentModel::Sonnet
+        | AgentModel::Haiku => claude::interactive(cwd, model.backend_model(), access, effort),
+        AgentModel::Codex | AgentModel::Sol | AgentModel::Luna | AgentModel::Terra => {
+            codex::interactive(cwd, model.backend_model(), access, effort)
         }
-        AgentModel::Codex => codex::interactive(cwd, None, access),
-        AgentModel::Sol => codex::interactive(cwd, Some("gpt-6-sol"), access),
-        AgentModel::Luna => codex::interactive(cwd, Some("gpt-6-luna"), access),
-        AgentModel::Terra => codex::interactive(cwd, Some("gpt-5.6-terra"), access),
-        AgentModel::Pi => pi::interactive(cwd, access),
-        AgentModel::Jsc => jsc::interactive(cwd, access),
+        AgentModel::Pi if effort == ReasoningEffort::Default => pi::interactive(cwd, access),
+        AgentModel::Jsc if effort == ReasoningEffort::Default => jsc::interactive(cwd, access),
+        AgentModel::Pi | AgentModel::Jsc => Err(
+            "extra reasoning effort is available only for Claude Code and Codex agents".to_owned(),
+        ),
     }
+}
+
+fn start_interactive_agent(
+    model: AgentModel,
+    access: AgentAccess,
+    effort: ReasoningEffort,
+    session: &mut Session,
+) {
+    let selector = format!(
+        "{}{}",
+        model.name(),
+        access.suffix().to_string().repeat(effort.suffix_count())
+    );
+    println!(
+        "[{selector} interactive {} session; exit it to return to euka]",
+        access.description()
+    );
+    let _ = io::stdout().flush();
+    let status = match interactive_agent(model, &session.cwd, access, effort) {
+        Ok(command) => agent_cli::run_interactive(command, model.name()),
+        Err(error) => {
+            eprintln!("euka: {error}");
+            1
+        }
+    };
+    session.last_status = status;
+    session.events.push(Event::Command {
+        input: selector,
+        status,
+    });
 }
 
 fn resolve_inline(
@@ -769,11 +918,11 @@ fn resolve_inline(
                 let agent_model = AgentModel::parse(model).ok_or("unknown inline agent model")?;
                 let references = ready_references(task, session, workers)?;
                 let id = workers.next_result_id();
+                let label = AgentLabel::new(model, AgentAccess::ReadOnly, id);
                 let mut context =
                     session_context_filtered(session, &references.ids, None, &session.cwd);
                 context.push_str(&format!(
-                    "request ({}, read-only, current user): {task}\n",
-                    agent_label(model, AgentAccess::ReadOnly, id)
+                    "request ({label}, read-only, current user): {task}\n"
                 ));
                 context.push_str(&references.text);
                 session.events.push(Event::AgentRequest {
@@ -784,21 +933,25 @@ fn resolve_inline(
                 });
                 println!(
                     "{}",
-                    render_agent(model, AgentAccess::ReadOnly, id, AgentDisplay::Working)
+                    render_agent(label, AgentDisplay::Working, Styling::Plain)
                 );
                 let _ = io::stdout().flush();
                 let answer = run_agent(
                     agent_model,
-                    task,
-                    &session.cwd,
-                    &context,
+                    agent_cli::Request {
+                        task,
+                        cwd: &session.cwd,
+                        context: &context,
+                        model: agent_model.backend_model(),
+                        access: AgentAccess::ReadOnly,
+                        user: AgentUser::Current,
+                        effort: ReasoningEffort::Default,
+                    },
                     &references.text,
-                    AgentAccess::ReadOnly,
-                    AgentUser::Current,
+                    AgentOutput::Final,
+                    |_| {},
                 )
-                .map_err(|error| {
-                    format!("{}: {error}", agent_label(model, AgentAccess::ReadOnly, id))
-                })?;
+                .map_err(|error| format!("{label}: {error}"))?;
                 let quoted = inline::quote_argument(&answer)?;
                 session.events.push(Event::AgentResponse {
                     id,
@@ -807,12 +960,7 @@ fn resolve_inline(
                 });
                 println!(
                     "{}",
-                    render_agent_output(
-                        model,
-                        AgentAccess::ReadOnly,
-                        id,
-                        AgentDisplay::Answer(&answer)
-                    )
+                    render_agent(label, AgentDisplay::Answer(&answer), Styling::Terminal)
                 );
                 resolved.push_str(&quoted);
             }
@@ -821,21 +969,30 @@ fn resolve_inline(
     Ok(resolved)
 }
 
-fn start_agents(
-    task: &str,
-    access: AgentAccess,
-    models: &[AgentModel],
-    user: AgentUser,
-    session: &mut Session,
-    workers: &mut Workers,
-) {
+fn start_agents(request: AgentTask<'_>, session: &mut Session, workers: &mut Workers) {
+    let AgentTask {
+        task,
+        models,
+        options,
+    } = request;
     if task.is_empty() || models.is_empty() {
         eprintln!("euka: agent unavailable or task is empty");
         session.last_status = 1;
         return;
     }
-    if user == AgentUser::Staffer && models.contains(&AgentModel::Fm) {
+    if options.user == AgentUser::Staffer && models.contains(&AgentModel::Fm) {
         eprintln!("euka: fm cannot run as staffer");
+        session.last_status = 1;
+        return;
+    }
+    if options.effort != ReasoningEffort::Default
+        && models
+            .iter()
+            .any(|model| matches!(model, AgentModel::Fm | AgentModel::Pi | AgentModel::Jsc))
+    {
+        eprintln!(
+            "euka: extra reasoning effort is available only for Claude Code and Codex agents"
+        );
         session.last_status = 1;
         return;
     }
@@ -847,28 +1004,33 @@ fn start_agents(
             return;
         }
     };
-    for &model in models {
-        let name = model.name();
+    for model in models {
         let id = workers.next_result_id();
         workers.active_agents += 1;
         session.events.push(Event::AgentRequest {
             id,
             input: task.into(),
-            access,
-            model: Some(name.to_owned()),
+            access: options.access,
+            model: Some(model.name().to_owned()),
         });
+        if options.effort != ReasoningEffort::Default {
+            session.agent_efforts.insert(id, options.effort);
+        }
+        if options.output == AgentOutput::Live {
+            session.streaming_agents.insert(id);
+        }
         let request = QueuedAgent {
             id,
             model,
             task: task.to_owned(),
             cwd: session.cwd.clone(),
-            access,
-            user,
+            options,
         };
+        let label = request.label().to_string();
         let status = match &references {
             ReferenceResolution::Ready(references) => {
                 launch_agent(request, references.clone(), session, workers);
-                render_agent(name, access, id, AgentDisplay::Working)
+                format!("{label}: …")
             }
             ReferenceResolution::Pending(ids) => {
                 let waiting_for = ids
@@ -876,10 +1038,7 @@ fn start_agents(
                     .map(|id| format!("#{id}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let status = format!(
-                    "{}: waiting for {waiting_for}",
-                    agent_label(name, access, id)
-                );
+                let status = format!("{label}: waiting for {waiting_for}");
                 workers.pending_agents.insert(id, status.clone());
                 workers.queued_agents.insert(id, request);
                 status
@@ -899,26 +1058,41 @@ fn launch_agent(
     workers: &mut Workers,
 ) {
     let context = agent_context(session, &request, &references);
+    workers
+        .pending_agents
+        .insert(request.id, format!("{}: …", request.label()));
     let QueuedAgent {
         id,
         model,
         task,
         cwd,
-        access,
-        user,
+        options,
     } = request;
     let references = references.text;
-    workers.pending_agents.insert(
-        id,
-        render_agent(model.name(), access, id, AgentDisplay::Working),
-    );
     let tx = workers.worker_tx.clone();
     std::thread::spawn(move || {
-        let result = run_agent(model, &task, &cwd, &context, &references, access, user);
+        let progress_tx = tx.clone();
+        let result = run_agent(
+            model,
+            agent_cli::Request {
+                task: &task,
+                cwd: &cwd,
+                context: &context,
+                model: model.backend_model(),
+                access: options.access,
+                user: options.user,
+                effort: options.effort,
+            },
+            &references,
+            options.output,
+            |status| {
+                let _ = progress_tx.send(WorkerUpdate::AgentProgress { id, status });
+            },
+        );
         let _ = tx.send(WorkerUpdate::Agent(AgentUpdate {
             id,
             model: model.name().to_owned(),
-            access,
+            access: options.access,
             result,
         }));
     });
@@ -931,14 +1105,14 @@ fn agent_context(
 ) -> String {
     let mut context =
         session_context_filtered(session, &references.ids, Some(request.id), &request.cwd);
-    let username = match request.user {
+    let username = match request.options.user {
         AgentUser::Current => "current user",
         AgentUser::Staffer => "staffer",
     };
     context.push_str(&format!(
         "request ({}, {}, {username}): {}\n",
-        agent_label(request.model.name(), request.access, request.id),
-        request.access.description(),
+        request.label(),
+        request.options.access.description(),
         request.task
     ));
     context.push_str(&references.text);
@@ -1259,6 +1433,11 @@ fn print_help() {
         "  🍎 task             Alias for fm? task",
         "  fm! task            Ask Apple Foundation Models to change files (background)",
         "  name! task          Ask a named agent to change files as your user",
+        "  opus?! task         Ask Opus to change files and show live progress",
+        "  luna?! task         Ask Luna to change files and show live progress",
+        "  opus?? task         Ask Opus with xhigh reasoning (read-only)",
+        "  sol!!! task         Ask Sol with max reasoning (write access)",
+        "  ??, !! / ???, !!!   Request xhigh / max on Claude or Codex agents",
         "  opus/luna? task     Ask both agents the same task (background)",
         "  @staffer opus? task Ask a CLI agent as staffer (requires sudo access)",
         "  fm?                 Enter fm read-only mode; ., exit, or Ctrl-C returns",
@@ -1266,6 +1445,7 @@ fn print_help() {
         "  echo $(date)        Run shell command substitution via Bash or Zsh",
         "  #3, codex?#3        Show a numbered result or full agent reply",
         "  #                   Show the latest completed agent reply",
+        "  Down at empty prompt  Expand this prompt and existing agent results",
         "  claude? agree? #3   Include a numbered result; queue if an agent is still working",
     ] {
         println!("{}", terminal::styled_input(line, color));
@@ -1358,12 +1538,13 @@ fn session_context_filtered(
                 model,
             } => context.push_str(&format!(
                 "request ({}, {}): {input}\n",
-                agent_label(model.as_deref().unwrap_or("default"), *access, *id),
+                AgentLabel::new(model.as_deref().unwrap_or("default"), *access, *id)
+                    .in_session(session),
                 access.description()
             )),
             Event::AgentResponse { id, model, text } => {
-                let label = agent_access_by_id(session, *id)
-                    .map(|access| agent_label(model, access, *id))
+                let label = agent_label_by_id(session, *id)
+                    .map(|label| AgentLabel { model, ..label }.to_string())
                     .unwrap_or_else(|| format!("{model}#{id}"));
                 context.push_str(&format!("response ({label}): {text}\n"))
             }
@@ -1405,8 +1586,8 @@ fn agent_response<'a>(
     }) {
         return Ok(text);
     }
-    let reference = agent_access_by_id(session, id)
-        .map(|access| agent_label(model, access, id))
+    let reference = agent_label_by_id(session, id)
+        .map(|label| AgentLabel { model, ..label }.to_string())
         .unwrap_or_else(|| format!("{model}#{id}"));
     let requested = session.events.iter().any(|event| {
         matches!(event,
@@ -1427,42 +1608,35 @@ fn agent_response_by_id<'a>(
     session: &'a Session,
     id: usize,
     workers: &Workers,
-) -> Result<(&'a str, AgentAccess, &'a str), String> {
-    let model =
-        agent_model_by_id(session, id).ok_or_else(|| format!("no reply found for #{id}"))?;
-    let text = agent_response(session, model, id, workers)?;
-    Ok((model, agent_access_by_id(session, id).unwrap(), text))
+) -> Result<(AgentLabel<'a>, &'a str), String> {
+    let label =
+        agent_label_by_id(session, id).ok_or_else(|| format!("no reply found for #{id}"))?;
+    let text = agent_response(session, label.model, id, workers)?;
+    Ok((label, text))
 }
 
-fn latest_agent_response(session: &Session) -> Option<(usize, &str, AgentAccess, &str)> {
+fn latest_agent_response(session: &Session) -> Option<(AgentLabel<'_>, &str)> {
     session.events.iter().rev().find_map(|event| {
         if let Event::AgentResponse { id, model, text } = event {
-            agent_access_by_id(session, *id)
-                .map(|access| (*id, model.as_str(), access, text.as_str()))
+            agent_label_by_id(session, *id)
+                .map(|label| (AgentLabel { model, ..label }, text.as_str()))
         } else {
             None
         }
     })
 }
 
-fn agent_request_by_id(session: &Session, id: usize) -> Option<(&str, AgentAccess)> {
+/// The label of the agent request with this id, with its recorded effort and output.
+fn agent_label_by_id(session: &Session, id: usize) -> Option<AgentLabel<'_>> {
     session.events.iter().find_map(|event| match event {
         Event::AgentRequest {
             id: request_id,
             model: Some(model),
             access,
             ..
-        } if *request_id == id => Some((model.as_str(), *access)),
+        } if *request_id == id => Some(AgentLabel::new(model, *access, id).in_session(session)),
         _ => None,
     })
-}
-
-fn agent_model_by_id(session: &Session, id: usize) -> Option<&str> {
-    agent_request_by_id(session, id).map(|(model, _)| model)
-}
-
-fn agent_access_by_id(session: &Session, id: usize) -> Option<AgentAccess> {
-    agent_request_by_id(session, id).map(|(_, access)| access)
 }
 
 fn http_response_by_id(session: &Session, id: usize) -> Option<String> {
@@ -1520,11 +1694,8 @@ fn ready_references(
         ReferenceResolution::Ready(references) => Ok(references),
         ReferenceResolution::Pending(ids) => {
             let id = ids[0];
-            if let Some(model) = agent_model_by_id(session, id) {
-                Err(format!(
-                    "{} is still working",
-                    agent_label(model, agent_access_by_id(session, id).unwrap(), id)
-                ))
+            if let Some(label) = agent_label_by_id(session, id) {
+                Err(format!("{label} is still working"))
             } else {
                 Err(format!("watch #{id} is still loading"))
             }
@@ -1569,19 +1740,23 @@ fn resolve_references(
             }
             None
         } else if let Some((model, access, id)) = session::agent_reference(token) {
-            let actual = agent_request_by_id(session, id);
-            if actual.is_none_or(|(actual_model, actual_access)| {
-                actual_model != model || access.is_some_and(|access| access != actual_access)
+            let actual = agent_label_by_id(session, id);
+            if actual.is_none_or(|actual| {
+                actual.model != model || access.is_some_and(|access| access != actual.access)
             }) {
                 let label = access
-                    .map(|access| agent_label(model, access, id))
+                    .map(|access| {
+                        AgentLabel::new(model, access, id)
+                            .in_session(session)
+                            .to_string()
+                    })
                     .unwrap_or_else(|| format!("{model}#{id}"));
                 return Err(format!("no reply found for {label}"));
             }
             Some((model, id))
         } else if let Some(id) = session::agent_number_reference(token) {
-            if let Some(model) = agent_model_by_id(session, id) {
-                Some((model, id))
+            if let Some(label) = agent_label_by_id(session, id) {
+                Some((label.model, id))
             } else if let Some(watch) = session.live_commands.iter().find(|watch| watch.id == id) {
                 if let Some(text) = watch_response_by_id(session, id, None) {
                     let revision = watch.revisions.len();
@@ -1610,8 +1785,10 @@ fn resolve_references(
             if seen.insert(id) {
                 match agent_response(session, model, id, workers) {
                     Ok(text) => {
-                        let label =
-                            agent_label(model, agent_access_by_id(session, id).unwrap(), id);
+                        let label = AgentLabel {
+                            model,
+                            ..agent_label_by_id(session, id).unwrap()
+                        };
                         context.push_str(&format!("\nReferenced reply {label}:\n{text}\n"));
                     }
                     Err(_) if workers.pending_agents.contains_key(&id) => {
@@ -1635,7 +1812,9 @@ fn resolve_references(
 fn drain_updates(workers: &mut Workers, session: &mut Session) -> Vec<String> {
     let mut lines = Vec::new();
     while let Ok(update) = workers.worker_rx.try_recv() {
-        lines.push(format_worker_update(update, session, workers));
+        if let Some(line) = format_worker_update(update, session, workers) {
+            lines.push(line);
+        }
     }
     let mut watch_updated = false;
     while let Ok(update) = workers.live_rx.try_recv() {
@@ -1704,9 +1883,19 @@ fn format_worker_update(
     update: WorkerUpdate,
     session: &mut Session,
     workers: &mut Workers,
-) -> String {
+) -> Option<String> {
     match update {
-        WorkerUpdate::Agent(update) => format_update(update, session, workers),
+        WorkerUpdate::Agent(update) => Some(format_update(update, session, workers)),
+        WorkerUpdate::AgentProgress { id, status } => {
+            if let Some(pending) = workers.pending_agents.get_mut(&id) {
+                let label = pending.split(':').next().unwrap_or(pending);
+                *pending = format!("{label}: {status}");
+                if !workers.interactive {
+                    return Some(pending.clone());
+                }
+            }
+            None
+        }
         WorkerUpdate::Http(update) => {
             workers.active_http = workers.active_http.saturating_sub(1);
             match update.result {
@@ -1722,7 +1911,7 @@ fn format_worker_update(
                         id: update.id,
                         resource,
                     });
-                    message
+                    Some(message)
                 }
                 Ok(HttpResult::Head { url, output }) => {
                     let message = format!("[head #{}] {url}\n{output}", update.id);
@@ -1731,11 +1920,11 @@ fn format_worker_update(
                         url,
                         output,
                     });
-                    message
+                    Some(message)
                 }
                 Err(error) => {
                     session.last_status = 1;
-                    format!("[url #{} error] {error}", update.id)
+                    Some(format!("[url #{} error] {error}", update.id))
                 }
             }
         }
@@ -1745,27 +1934,24 @@ fn format_worker_update(
 fn format_update(update: AgentUpdate, session: &mut Session, workers: &mut Workers) -> String {
     workers.active_agents = workers.active_agents.saturating_sub(1);
     workers.pending_agents.remove(&update.id);
-    let model = update.model;
-    let line = match update.result {
+    let label = AgentLabel::new(&update.model, update.access, update.id).in_session(session);
+    let line = match &update.result {
         Ok(text) => {
-            session.events.push(Event::AgentResponse {
-                id: update.id,
-                model: model.clone(),
-                text: text.clone(),
-            });
             let display = match update.access {
-                AgentAccess::ReadOnly => AgentDisplay::Answer(&text),
-                AgentAccess::ReadWrite => AgentDisplay::FullAnswer(&text),
+                AgentAccess::ReadOnly => AgentDisplay::Answer(text),
+                AgentAccess::ReadWrite => AgentDisplay::FullAnswer(text),
             };
-            render_agent_output(&model, update.access, update.id, display)
+            render_agent(label, display, Styling::Terminal)
         }
-        Err(error) => render_agent_output(
-            &model,
-            update.access,
-            update.id,
-            AgentDisplay::Error(&error),
-        ),
+        Err(error) => render_agent(label, AgentDisplay::Error(error), Styling::Terminal),
     };
+    if let Ok(text) = update.result {
+        session.events.push(Event::AgentResponse {
+            id: update.id,
+            model: update.model,
+            text,
+        });
+    }
     resume_queued_agents(session, workers);
     line
 }
@@ -1788,20 +1974,16 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
                     .map(|id| format!("#{id}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                workers.pending_agents.insert(
-                    id,
-                    format!(
-                        "{}: waiting for {status}",
-                        agent_label(request.model.name(), request.access, id)
-                    ),
-                );
+                workers
+                    .pending_agents
+                    .insert(id, format!("{}: waiting for {status}", request.label()));
             }
             Err(error) => {
                 let request = workers.queued_agents.remove(&id).unwrap();
                 let _ = workers.worker_tx.send(WorkerUpdate::Agent(AgentUpdate {
                     id,
                     model: request.model.name().to_owned(),
-                    access: request.access,
+                    access: request.options.access,
                     result: Err(format!("referenced reply unavailable: {error}")),
                 }));
             }
@@ -1812,15 +1994,51 @@ fn resume_queued_agents(session: &Session, workers: &mut Workers) {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_context, agent_response, agent_response_by_id, diff_lines, format_update,
-        highlight_answer, latest_agent_response, prompt, ready_references, render_agent,
-        reset_state, resolve_references, session_context, shortened_path, start_agents,
-        AgentDisplay, AgentUpdate, ReferenceResolution, Workers,
+        agent_context, agent_response, agent_response_by_id, diff_lines, emphasize_prompt,
+        expanded_agent_results, format_update, highlight_answer, latest_agent_response, prompt,
+        ready_references, render_agent, render_session_agent, reset_state, resolve_references,
+        session_context, shortened_path, start_agents, AgentDisplay, AgentLabel, AgentUpdate,
+        PromptLine, ReferenceResolution, Styling, Workers,
     };
-    use crate::agent_cli::AgentUser;
-    use crate::session::{AgentAccess, AgentModel, DiffMode, Event, PromptMode, Session};
+    use crate::session::{
+        AgentAccess, AgentModel, AgentOptions, AgentTask, DiffMode, DisplayDetail, Event,
+        PromptMode, ReasoningEffort, Session,
+    };
     use crate::terminal::Terminal;
     use std::path::Path;
+
+    #[test]
+    fn streamed_result_keeps_selector_in_final_and_recall() {
+        let mut session = Session::new().unwrap();
+        session.streaming_agents.insert(1);
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "Update the README".into(),
+            access: AgentAccess::ReadWrite,
+            model: Some("opus".into()),
+        });
+        let mut workers = Workers::new(false);
+        let final_line = format_update(
+            AgentUpdate {
+                id: 1,
+                model: "opus".into(),
+                access: AgentAccess::ReadWrite,
+                result: Ok("Updated README".into()),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(final_line, "opus?!#1: Updated README");
+        assert_eq!(
+            render_session_agent(
+                &session,
+                AgentLabel::new("opus", AgentAccess::ReadWrite, 1),
+                AgentDisplay::FullAnswer("Updated README"),
+                PromptLine::WhenExpanded
+            ),
+            "opus?!#1: Updated README"
+        );
+    }
 
     #[test]
     fn reset_restarts_counters_and_discards_old_worker_updates() {
@@ -1843,6 +2061,7 @@ mod tests {
         assert!(session.todos.is_empty());
         assert!(session.live_commands.is_empty());
         assert!(session.mode == PromptMode::Shell);
+        assert!(session.detail == DisplayDetail::Compact);
         assert_eq!(session.last_status, 0);
         assert!(old_sender
             .send(super::WorkerUpdate::Agent(super::AgentUpdate {
@@ -1898,37 +2117,150 @@ mod tests {
     fn every_agent_uses_the_same_reply_label() {
         for model in ["fm", "claude", "codex", "pi"] {
             assert_eq!(
-                render_agent(model, AgentAccess::ReadOnly, 4, AgentDisplay::Working),
+                render_agent(
+                    AgentLabel::new(model, AgentAccess::ReadOnly, 4),
+                    AgentDisplay::Working,
+                    Styling::Plain
+                ),
                 format!("{model}?#4: …")
             );
             assert_eq!(
                 render_agent(
-                    model,
-                    AgentAccess::ReadOnly,
-                    4,
-                    AgentDisplay::Answer("done")
+                    AgentLabel::new(model, AgentAccess::ReadOnly, 4),
+                    AgentDisplay::Answer("done"),
+                    Styling::Plain
                 ),
                 format!("{model}?#4: done")
             );
             assert_eq!(
                 render_agent(
-                    model,
-                    AgentAccess::ReadWrite,
-                    4,
-                    AgentDisplay::Error("failed")
+                    AgentLabel::new(model, AgentAccess::ReadWrite, 4),
+                    AgentDisplay::Error("failed"),
+                    Styling::Plain
                 ),
                 format!("{model}!#4: error: failed")
             );
             assert_eq!(
                 render_agent(
-                    model,
-                    AgentAccess::ReadWrite,
-                    4,
-                    AgentDisplay::FullAnswer("line one\nline two")
+                    AgentLabel::new(model, AgentAccess::ReadWrite, 4),
+                    AgentDisplay::FullAnswer("line one\nline two"),
+                    Styling::Plain
                 ),
                 format!("{model}!#4: line one\nline two")
             );
         }
+    }
+
+    #[test]
+    fn down_expands_existing_results_without_changing_future_updates() {
+        let mut session = Session::new().unwrap();
+        session.events.push(Event::AgentRequest {
+            id: 1,
+            input: "Inspect the parser".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("opus".into()),
+        });
+        session.events.push(Event::AgentResponse {
+            id: 1,
+            model: "opus".into(),
+            text: "Looks sound".into(),
+        });
+        session.detail = DisplayDetail::Expanded;
+        assert_eq!(
+            expanded_agent_results(&mut session),
+            ["opus?#1 prompt: Inspect the parser\nopus?#1: Looks sound"]
+        );
+        assert!(expanded_agent_results(&mut session).is_empty());
+
+        session.events.push(Event::AgentRequest {
+            id: 2,
+            input: "Check the tests".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("luna".into()),
+        });
+        let mut workers = Workers::new(false);
+        let output = format_update(
+            AgentUpdate {
+                id: 2,
+                model: "luna".into(),
+                access: AgentAccess::ReadOnly,
+                result: Ok("Tests pass".into()),
+            },
+            &mut session,
+            &mut workers,
+        );
+        assert_eq!(output, "luna?#2: Tests pass");
+        assert_eq!(
+            render_session_agent(
+                &session,
+                AgentLabel::new("luna", AgentAccess::ReadOnly, 2),
+                AgentDisplay::FullAnswer("Tests pass"),
+                PromptLine::WhenExpanded
+            ),
+            "luna?#2: Tests pass"
+        );
+        assert_eq!(
+            expanded_agent_results(&mut session),
+            ["luna?#2 prompt: Check the tests\nluna?#2: Tests pass"]
+        );
+    }
+
+    #[test]
+    fn reasoning_result_keeps_its_suffix_when_recalled() {
+        let mut session = Session::new().unwrap();
+        session.agent_efforts.insert(3, ReasoningEffort::ExtraHigh);
+        session.events.push(Event::AgentRequest {
+            id: 3,
+            input: "Inspect this".into(),
+            access: AgentAccess::ReadOnly,
+            model: Some("opus".into()),
+        });
+        let mut workers = Workers::new(false);
+        assert_eq!(
+            format_update(
+                AgentUpdate {
+                    id: 3,
+                    model: "opus".into(),
+                    access: AgentAccess::ReadOnly,
+                    result: Ok("Looks sound".into()),
+                },
+                &mut session,
+                &mut workers
+            ),
+            "opus??#3: Looks sound"
+        );
+        assert_eq!(
+            render_session_agent(
+                &session,
+                AgentLabel::new("opus", AgentAccess::ReadOnly, 3),
+                AgentDisplay::FullAnswer("Looks sound"),
+                PromptLine::WhenExpanded
+            ),
+            "opus??#3: Looks sound"
+        );
+        assert_eq!(
+            render_agent(
+                AgentLabel {
+                    effort: ReasoningEffort::Maximum,
+                    ..AgentLabel::new("sol", AgentAccess::ReadWrite, 4)
+                },
+                AgentDisplay::Working,
+                Styling::Plain
+            ),
+            "sol!!!#4: …"
+        );
+    }
+
+    #[test]
+    fn expanded_request_is_bold_when_colored() {
+        assert_eq!(
+            emphasize_prompt("opus?#3 prompt: inspect this", true),
+            "\x1b[1mopus?#3 prompt: inspect this\x1b[0m"
+        );
+        assert_eq!(
+            emphasize_prompt("opus?#3 prompt: inspect this", false),
+            "opus?#3 prompt: inspect this"
+        );
     }
 
     #[test]
@@ -1986,8 +2318,7 @@ mod tests {
         assert_eq!(
             agent_response_by_id(&session, 3, &workers).unwrap(),
             (
-                "codex",
-                AgentAccess::ReadOnly,
+                AgentLabel::new("codex", AgentAccess::ReadOnly, 3),
                 "the full\nmultiline finding"
             )
         );
@@ -2021,7 +2352,10 @@ mod tests {
         });
         assert_eq!(
             latest_agent_response(&session),
-            Some((2, "opus", AgentAccess::ReadWrite, "second finished first"))
+            Some((
+                AgentLabel::new("opus", AgentAccess::ReadWrite, 2),
+                "second finished first"
+            ))
         );
         session.events.push(Event::AgentResponse {
             id: 1,
@@ -2030,7 +2364,10 @@ mod tests {
         });
         assert_eq!(
             latest_agent_response(&session),
-            Some((1, "sol", AgentAccess::ReadOnly, "first finished last"))
+            Some((
+                AgentLabel::new("sol", AgentAccess::ReadOnly, 1),
+                "first finished last"
+            ))
         );
     }
 
@@ -2078,10 +2415,11 @@ mod tests {
         });
 
         start_agents(
-            "summarize #2",
-            AgentAccess::ReadOnly,
-            &[AgentModel::Luna],
-            AgentUser::Current,
+            AgentTask {
+                task: "summarize #2",
+                models: vec![AgentModel::Luna],
+                options: AgentOptions::new(AgentAccess::ReadOnly),
+            },
             &mut session,
             &mut workers,
         );
@@ -2104,7 +2442,7 @@ mod tests {
         );
         assert!(!workers.queued_agents.contains_key(&3));
         let update = workers.worker_rx.try_recv().unwrap();
-        let line = super::format_worker_update(update, &mut session, &mut workers);
+        let line = super::format_worker_update(update, &mut session, &mut workers).unwrap();
         assert!(line.contains("referenced reply unavailable: sol?#2 has no reply"));
         assert!(workers.pending_agents.is_empty());
         assert_eq!(workers.active_agents, 0);
@@ -2165,10 +2503,11 @@ mod tests {
         });
         workers.pending_agents.insert(2, "sol?#2: …".into());
         start_agents(
-            "summarize #2",
-            AgentAccess::ReadOnly,
-            &[AgentModel::Luna],
-            AgentUser::Current,
+            AgentTask {
+                task: "summarize #2",
+                models: vec![AgentModel::Luna],
+                options: AgentOptions::new(AgentAccess::ReadOnly),
+            },
             &mut session,
             &mut workers,
         );
@@ -2209,19 +2548,17 @@ mod tests {
         let long = "abcdefghijk".repeat(20);
         assert_eq!(
             render_agent(
-                "claude",
-                AgentAccess::ReadOnly,
-                1,
-                AgentDisplay::Answer(&long)
+                AgentLabel::new("claude", AgentAccess::ReadOnly, 1),
+                AgentDisplay::Answer(&long),
+                Styling::Plain
             ),
             format!("claude?#1: {long}")
         );
         assert_eq!(
             render_agent(
-                "sol",
-                AgentAccess::ReadOnly,
-                2,
-                AgentDisplay::Answer("first\nsecond")
+                AgentLabel::new("sol", AgentAccess::ReadOnly, 2),
+                AgentDisplay::Answer("first\nsecond"),
+                Styling::Plain
             ),
             "sol?#2: first\nsecond"
         );

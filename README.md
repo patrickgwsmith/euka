@@ -70,6 +70,10 @@ For a short read-only request, use `🎵 task` or `🎶 task` for `opus? task`, 
 
 `Opus? task` also works as `opus? task`.
 
+Repeat the final `?` or `!` to request more reasoning from Claude Code or Codex agents. `opus?? task` and `sol!! task` request `xhigh`; `opus??? task` and `sol!!! task` request `max`. `?` remains read-only and `!` retains write access. A single suffix uses the agent's normal effort setting. This also works with a read-only group, such as `opus/luna?? task`, or with a bare interactive selector such as `opus??`. Euka shows the requested suffix in each result label, for example `opus??#3`. The selected model or your provider settings may limit the actual effort; if the provider rejects the requested level, Euka reports its error.
+
+Use `opus?! task` or `luna?! task` to give an agent write access and show live progress while it works. Euka updates the pending line from Claude Code's or Codex's streamed events, then records the complete final answer as `opus?!#n` or `luna?!#n`. This works with all Claude Code and Codex model names. The stream is shown only in the terminal; the shared session stores the final answer.
+
 You can paste a multiline request, including its `opus?` prefix, into the interactive prompt. Euka keeps the pasted line breaks in one request; press Enter after pasting to send it.
 
 Enter an agent name with no request, for example `opus?` or `codex!`, to open that agent's own interactive CLI in the terminal. With `?` the session is read-only, using the same read-only tools and macOS sandbox as a `?` request. With `!` it can change files, using the same tools and sandbox settings as a `!` request. Bare `jsc?` or `jsc!` opens the jsc REPL, and bare `fm?` or `fm!` enters fm mode. When you exit the agent, you return to the Euka prompt.
@@ -278,7 +282,7 @@ The prompt shows a short form of the current directory. It shows the first chara
 
 In an interactive terminal, Euka sets the terminal title to the same shortened directory path shown in the prompt and updates it after `cd` or a child command changes the title.
 
-To show the full path for three seconds, press Down at an empty prompt.
+Press Down at an empty prompt to show its full path until you enter a command or press Ctrl-C. The next prompt uses the short path again. Euka also reprints completed agent results with the request that produced each one. New results stay compact; press Down again to expand those results.
 
 Colors help you see the access level before you press Enter:
 
@@ -289,7 +293,7 @@ Colors help you see the access level before you press Enter:
 | Blue | Commands as `staffer`: `bash?`, `zsh?`, and `@staffer` |
 | Red | Commands as you through a shell: `bash!` and `zsh!` |
 
-Watched commands, for example `+ bash?`, use the same colors. Agent answers color the reply label, Markdown bold text, bullet marks, and inline code. To remove the colors, set `NO_COLOR=1`.
+Entered commands and agent requests appear in bold, while selector colors still show their access level. Expanded agent results show the original request in bold. Watched commands, for example `+ bash?`, use the same colors. Agent answers color the reply label, Markdown bold text, bullet marks, and inline code. To remove the colors, set `NO_COLOR=1`.
 
 Editing keys:
 
@@ -325,4 +329,4 @@ Tab completion accepts relative paths, absolute paths, and paths that start with
 
 ## TODO
 
-- [ ] Show live status for background Codex requests by reading `codex exec --json` events as they arrive, similar to Claude Code's `stream-json` output. Keep the final answer as the numbered result.
+- [ ] Support `opus?sol! task` as an automatic two-stage request: Opus makes a read-only plan, then Sol receives the original task and completed plan and implements it with write access. Give each stage its own result number; do not start Sol if Opus fails.
